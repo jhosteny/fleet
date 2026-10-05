@@ -1,0 +1,269 @@
+defmodule DurableServer.CircuitBreaker do
+  @moduledoc false
+
+  alias DurableServer.CircuitBreaker
+
+  defstruct supervisor_name: nil, table_name: nil, config: nil, object_store: nil
+
+  @doc """
+  Creates a new CircuitBreaker struct and initializes the ets table.
+
+  This should only be called from `DurableServer.Supervisor.init/1`.
+  The table is namespaced by supervisor name to allow multiple supervisors to coexist.
+  """
+  def new(supervisor_name, config) when is_atom(supervisor_name) do
+    table_name = circuit_breaker_table_name(supervisor_name)
+    {object_store, config} = Map.pop!(config, :object_store)
+
+    case :ets.whereis(table_name) do
+      :undefined ->
+        :ets.new(table_name, [:set, :public, :named_table])
+
+      _existing ->
+        raise ArgumentError, "Circuit breaker ets table #{inspect(table_name)} already exists"
+    end
+
+    %CircuitBreaker{
+      object_store: object_store,
+      supervisor_name: supervisor_name,
+      table_name: table_name,
+      config: config
+    }
+  end
+
+  @doc """
+  Checks crash history and determines crash status for an object.
+
+  Returns a tuple with the new status and updated crash history.
+  The caller is responsible for updating the storage.
+  """
+  def check_object_crash_status(%CircuitBreaker{config: config} = breaker, meta, crash_entry) do
+    updated_history =
+      add_crash_to_history(
+        meta.crash_history,
+        crash_entry,
+        config
+      )
+
+    current_window_crashes = count_recent_crashes(breaker, updated_history)
+
+    status =
+      if current_window_crashes >= config.crash_threshold_count do
+        :permanently_crashed
+      else
+        :crashed
+      end
+
+    {status, updated_history}
+  end
+
+  @doc """
+  Checks if the module-wide circuit breaker allows operations.
+
+  Returns `:ok` if operations are allowed, or `{:circuit_open, cooldown_ms}`
+  if the circuit breaker is open.
+  """
+  def check_module_circuit_breaker(%CircuitBreaker{table_name: table, config: config}, module) do
+    current_time = System.system_time(:millisecond)
+
+    check_windowed(
+      table,
+      module,
+      current_time,
+      config.module_circuit_breaker_window_ms,
+      config.module_circuit_breaker_count,
+      config.module_circuit_breaker_cooldown_ms
+    )
+  end
+
+  @doc """
+  Increments the module-wide circuit breaker counter.
+
+  Called whenever a restart attempt is made (successful or not)
+  to track the restart frequency for circuit breaker logic.
+  """
+  def increment_module_circuit_breaker(%CircuitBreaker{table_name: table}, module) do
+    current_time = System.system_time(:millisecond)
+    inc(table, module, current_time)
+  end
+
+  @doc """
+  Checks if the global lock failure circuit breaker allows lock acquisition attempts.
+
+  Returns `:ok` if lock acquisition attempts are allowed, or `{:circuit_open, cooldown_ms}`
+  if too many lock failures have occurred recently (indicating network partition/flapping).
+  """
+  def check_global_lock_circuit_breaker(%CircuitBreaker{table_name: table, config: config}) do
+    current_time = System.system_time(:millisecond)
+
+    check_windowed(
+      table,
+      :global_lock_failures,
+      current_time,
+      config.global_lock_failure_window_ms,
+      config.global_lock_failure_count,
+      config.global_lock_failure_cooldown_ms
+    )
+  end
+
+  @doc """
+  Increments the global lock failure counter.
+
+  Called whenever a lock acquisition attempt fails with {:already_started, pid},
+  indicating another node owns the lock. During network partition/flapping,
+  this prevents hammering object storage when we can't see remote nodes in group registry.
+  """
+  def increment_global_lock_failures(%CircuitBreaker{table_name: table}) do
+    current_time = System.system_time(:millisecond)
+    inc(table, :global_lock_failures, current_time)
+  end
+
+  @doc """
+  Checks if remote placement attempts to `node_str` are currently rate-limited.
+
+  Returns `:ok` when placement attempts are allowed, or
+  `{:circuit_open, cooldown_ms}` when the node is in timeout cooldown.
+  """
+  def check_placement_node_timeout_circuit_breaker(
+        %CircuitBreaker{table_name: table},
+        node_str
+      )
+      when is_binary(node_str) do
+    key = {:placement_node_timeout, node_str}
+    current_time = System.system_time(:millisecond)
+
+    case check_cooldown(table, key, current_time) do
+      :ok ->
+        # cleanup expired cooldown entries aggressively to keep table small
+        :ets.delete(table, key)
+        :ok
+
+      other ->
+        other
+    end
+  end
+
+  @doc """
+  Opens a timeout cooldown for remote placement attempts to `node_str`.
+
+  This is used to avoid repeatedly hammering nodes that are timing out during
+  rolling deploys or transient network events.
+  """
+  def trip_placement_node_timeout_circuit_breaker(
+        %CircuitBreaker{table_name: table},
+        node_str,
+        cooldown_ms
+      )
+      when is_binary(node_str) and is_integer(cooldown_ms) and cooldown_ms > 0 do
+    key = {:placement_node_timeout, node_str}
+    current_time = System.system_time(:millisecond)
+    trip_cooldown(table, key, current_time, cooldown_ms)
+  end
+
+  @doc """
+  Prunes stale entries from the circuit breaker ets table.
+
+  Called periodically by the LifecycleManager to clean up old entries
+  that are outside their respective time windows.
+  """
+  def prune_stale_entries(%CircuitBreaker{table_name: table, config: config}) do
+    current_time = System.system_time(:millisecond)
+    prune(table, current_time, config.module_circuit_breaker_window_ms)
+  end
+
+  defp circuit_breaker_table_name(supervisor_name) do
+    :"circuit_breaker_#{supervisor_name}"
+  end
+
+  defp add_crash_to_history(history, crash_entry, config) do
+    current_time = crash_entry.timestamp
+    window_start = current_time - config.crash_threshold_window_ms
+
+    [crash_entry | history]
+    |> Enum.filter(fn %{timestamp: ts} -> ts > window_start end)
+    # Limit history size
+    |> Enum.take(config.crash_threshold_count)
+  end
+
+  defp count_recent_crashes(%CircuitBreaker{} = breaker, crash_history) do
+    current_time = System.system_time(:millisecond)
+    window_start = current_time - breaker.config.crash_threshold_window_ms
+
+    Enum.count(crash_history, fn %{timestamp: ts} -> ts > window_start end)
+  end
+
+  defp check_windowed(table, key, current_time, window_ms, limit, cooldown_ms) do
+    window_start = current_time - window_ms
+
+    case :ets.lookup(table, key) do
+      [{^key, _count, _last_reset, cooldown_until}] when current_time < cooldown_until ->
+        {:circuit_open, cooldown_until - current_time}
+
+      [{^key, _count, last_reset, _cooldown_until}] when last_reset < window_start ->
+        reset_window(table, key, current_time)
+        :ok
+
+      [{^key, count, last_reset, _cooldown_until}] when count >= limit ->
+        trip_cooldown(table, key, current_time, cooldown_ms, count, last_reset)
+        {:circuit_open, cooldown_ms}
+
+      _ ->
+        :ok
+    end
+  end
+
+  defp check_cooldown(table, key, current_time) do
+    case :ets.lookup(table, key) do
+      [{^key, _count, _last_reset, cooldown_until}] when current_time < cooldown_until ->
+        {:circuit_open, cooldown_until - current_time}
+
+      [{^key, _count, _last_reset, _cooldown_until}] ->
+        :ok
+
+      _ ->
+        :ok
+    end
+  end
+
+  defp inc(table, key, current_time) do
+    # Use atomic update_counter to avoid race conditions.
+    try do
+      :ets.update_counter(table, key, {2, 1})
+    catch
+      :error, :badarg ->
+        # Key doesn't exist, insert initial entry and try again.
+        :ets.insert(table, {key, 0, current_time, 0})
+        :ets.update_counter(table, key, {2, 1})
+    end
+
+    :ok
+  end
+
+  defp trip_cooldown(table, key, current_time, cooldown_ms) do
+    trip_cooldown(table, key, current_time, cooldown_ms, 1, current_time)
+  end
+
+  defp trip_cooldown(table, key, current_time, cooldown_ms, count, last_reset) do
+    cooldown_until = current_time + cooldown_ms
+    :ets.insert(table, {key, count, last_reset, cooldown_until})
+    :ok
+  end
+
+  defp reset_window(table, key, current_time) do
+    :ets.insert(table, {key, 0, current_time, 0})
+  end
+
+  defp prune(table, current_time, window_ms) do
+    window_start = current_time - window_ms
+
+    # Use select_delete to atomically remove stale entries.
+    # Delete entries where last_reset is older than window_start and cooldown_until is not active.
+    match_spec = [
+      {{:"$1", :"$2", :"$3", :"$4"},
+       [{:and, {:<, :"$3", window_start}, {:"=<", :"$4", current_time}}], [true]}
+    ]
+
+    :ets.select_delete(table, match_spec)
+    :ok
+  end
+end

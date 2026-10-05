@@ -1,0 +1,3455 @@
+defmodule DurableServer.LifecycleManager do
+  @moduledoc false
+
+  _archdoc = """
+  Manages the lifecycle and automatic restart of DurableServer processes across a cluster.
+
+  ## Architecture
+
+  The LifecycleManager detects and restart failed DurableServer processes across the cluster,
+  while ensuring only a single process is restarted for a given key across the global cluster.
+
+  The coordination for durable server starts takes three paths:
+
+  1. **Fast path**: Uses `:syn`'s eventually consistent distributed registry for near-instant
+    health detection of running servers. If an object's keys is already registered,
+    then we don't restart it.
+  2. **Slow path**: Falls back to node heartbeats + process lock validation for edge cases.
+    Locks are carried out over an etag based object store claim.
+  3. **Sticky placement**: Uses environment variable-based placement preferences with
+    time-gated fallback to ensure servers restart on preferred nodes when possible.
+
+  ## Node Heartbeat System
+
+  Instead of per-object heartbeats, the lifecycle manager maintains node-level heartbeats:
+  - Each node writes a single heartbeat to `__nodes/{node_name}` in object storage
+  - Heartbeats are cached locally in ets for fast lookup during health checks
+
+  ## Lifecycle Management
+
+  The `DurableServer.Supervisor` starts several processes, including its own `Task.Supervisor` and
+  `DynamicSupervisor`:
+
+  - `DurableServer.Supervisor` - Main supervisor providing isolation and configuration
+  - `DurableServer.LifecycleManager` - Monitors and restarts failed processes across the cluster
+  - `DurableServer.Terminator` - Coordinates graceful shutdown to ensure state persistence
+
+  ## Restart Lifecycle
+
+  ### Server States
+  - `:running` - Server is actively running and registered in `:syn`
+  - `:stopped_graceful` - Server was intentionally stopped, eligible for restart
+  - `:stopped_permanent` - Server was permanently stopped, never restart
+  - `:crashed` - Server crashed or failed, always restart
+
+  ### Discovery Process
+  1. Write node heartbeat and refresh heartbeat cache
+  2. List all DurableServer objects from ObjectStore (paginated with continuation tokens)
+  3. Check health using check_server_health/2 (uses group + heartbeat cache)
+  4. Apply consistent hashing to determine which servers this node should handle
+  5. Detect orphaned servers (any node can claim these regardless of hash assignment)
+  6. Attempt atomic restart claiming via DurableServer.claim_restart_attempt/2
+
+  ### Restart Claiming Protocol
+  Each restart attempt uses atomic ObjectStore operations to prevent race conditions:
+  - `DurableServer.claim_restart_attempt/2` handles atomic claiming with TTL
+  - If claim succeeds, this node "owns" the restart attempt for 30 seconds
+  - If claim fails, another node is already handling the restart
+  - TTL ensures stale claims are eventually cleaned up
+
+  ## Health Detection
+
+  ### `:syn` Registry (Fast Path)
+  - Each DurableServer registers itself in the global :durable_servers scope on startup
+  - Automatic deregistration on process termination or node failure
+  - LifecycleManager skips restart attempts for servers present in `:syn`
+  - `:syn` is eventually consistent, so slow path validation via rpc calls is
+    still necessary as a fallback
+
+  ### Node Heartbeats + Process Lock (Slow Path)
+  Used when `:syn` registry appears incomplete or for final validation:
+  - Check if target node is healthy via cached heartbeat data
+  - Validate process lock via rpc call to ensure object store recorded node/pid is not still alive
+
+  ## Edge Case Handling
+
+  ### Rolling Deploys
+  - Uses DNS-based node discovery (no connectivity checks during consistent hashing)
+  - Assumes all DNS-returned nodes are valid for hash distribution
+  - Orphan detection handles cases where assigned nodes are temporarily unreachable
+
+  ### Network Partitions
+  - Multiple nodes may attempt restart during partitions
+  - Atomic ObjectStore operations ensure only one succeeds
+  - Group registry eventual consistency provides healing after partition resolution
+
+  ### Orphaned Servers
+  Any server is considered orphaned and claimable by any node if:
+  - Target node heartbeat is stale or missing
+  - Process lock validation fails (lock expired)
+  - Status is explicitly :crashed
+  - Previous restart attempt has expired (past TTL)
+
+  ### Object Storage Failures
+  - Discovery continues if individual object reads fail (logged but skipped)
+  - List operations retried at the GenServer level
+  - Atomic claim failures are treated as "already claimed" rather than errors
+  """
+
+  use GenServer
+  require Logger
+
+  alias DurableServer.LifecycleManager
+  alias DurableServer
+  alias DurableServer.{StoredState, Meta, CircuitBreaker, HeartbeatWatchdog}
+  alias DurableServer.ObjectStore
+  alias DurableServer.StorageBackend
+
+  defstruct supervisor_name: nil,
+            task_sup: nil,
+            config: nil,
+            circuit_breaker: nil,
+            object_store: nil,
+            heartbeat_store: nil,
+            prefix: nil,
+            node_module: nil,
+            current_discovery_task: nil,
+            current_heartbeat_task: nil,
+            heartbeat_table: nil,
+            discovery_interval_ms: nil,
+            initial_discovery_delay_ms: nil,
+            heartbeat_interval_ms: nil,
+            heartbeat_tracking_mode: :poll,
+            heartbeat_reconcile_interval_ms: nil,
+            heartbeat_subscription_ref: nil,
+            capacity_limits: %{},
+            heartbeat_meta: nil,
+            last_successful_heartbeat_at: nil,
+            heartbeat_watchdog: nil,
+            # Last successful heartbeat timing for diagnostics
+            last_heartbeat_timing: nil,
+            discovery_diag_table: nil,
+            discovery_skip_table: nil,
+            restart_gate_table: nil,
+            discovery_stopped: false,
+            discovery_burst_remaining: 0,
+            discovery_shuffle_batch_size: nil,
+            parallel_restart_batch_size: nil,
+            restart_start_timeout_ms: nil,
+            restart_claim_preferred_fanout: nil,
+            restart_claim_expanded_fanout: nil,
+            restart_claim_gate_expand_after_ms: nil,
+            restart_claim_gate_disable_after_ms: nil
+
+  # Buffer for heartbeat deadline - time for crash/cleanup before orphan threshold.
+  # Orphan threshold is configurable and already includes grace period,
+  # so we only need a small buffer for crash propagation time
+  @heartbeat_deadline_buffer_ms :timer.seconds(2)
+  @default_restart_start_timeout_ms :timer.seconds(30)
+  @restart_claim_ttl_min_ms :timer.seconds(30)
+  @restart_claim_ttl_buffer_ms :timer.seconds(10)
+  @restart_claim_preferred_fanout 2
+  @restart_claim_expanded_fanout 4
+  @restart_claim_gate_expand_after_ms :timer.seconds(30)
+  @restart_claim_gate_disable_after_ms :timer.minutes(2)
+  @default_initial_discovery_delay_ms {1_000, 6_000}
+  # batch size for accumulating keys before shuffling - provides randomization for load distribution
+  # during cold deploys while maintaining bounded memory usage
+  @default_discovery_shuffle_batch_size 20_000
+  # parallel processing batch size - how many restart attempts to run concurrently
+  @default_parallel_restart_batch_size 50
+  # Default threshold for considering a node's heartbeat stale
+  @default_heartbeat_staleness_threshold_ms :timer.seconds(30)
+  # Threshold for considering a node unhealthy when finding eligible placement nodes
+  @node_health_staleness_threshold_ms :timer.seconds(50)
+  @resource_check_interval_ms :timer.seconds(60)
+  # Skip set entries expire after 10 minutes. Deleted objects won't appear
+  # in LIST anymore, so their entries would never self-invalidate via etag.
+  # TTL ensures churned objects don't accumulate unbounded memory.
+  @discovery_skip_ttl_ms :timer.minutes(10)
+  @discovery_skip_sweep_interval_ms :timer.minutes(5)
+  @heartbeat_group_key "__heartbeat"
+  @heartbeat_write_retry_backoff_ms {50, 250}
+
+  def name(supervisor_name), do: :"#{supervisor_name}_lifecycle_manager"
+
+  def start_link(opts) do
+    supervisor_name = Keyword.fetch!(opts, :supervisor_name)
+    GenServer.start_link(__MODULE__, opts, name: name(supervisor_name))
+  end
+
+  @doc """
+  Returns the current heartbeat timing metrics for this node.
+
+  Returns a map with:
+  - `:last_heartbeat_timing` - The timing from the last successful heartbeat (put_ms, cache_ms, total_ms)
+  - `:last_successful_heartbeat_at` - Timestamp of last successful heartbeat
+  - `:node` - This node's name
+
+  This is used by the admin dashboard to monitor heartbeat health across the cluster.
+  """
+  def get_heartbeat_metrics(supervisor_name) when is_atom(supervisor_name) do
+    GenServer.call(name(supervisor_name), :get_heartbeat_metrics)
+  end
+
+  @doc """
+  Returns lifecycle discovery diagnostic counters for debugging cluster contention.
+
+  Keys are aggregate atoms, plus a small set of bounded tuple keys where the
+  second element is an atom reason (for example
+  `{:remote_placement_erpc_error, :timeout}`).
+  """
+  def get_discovery_diagnostics(supervisor_name) when is_atom(supervisor_name) do
+    table_name = discovery_diagnostics_table_name(supervisor_name)
+
+    case :ets.whereis(table_name) do
+      :undefined -> %{}
+      _ -> :ets.tab2list(table_name) |> Map.new()
+    end
+  rescue
+    ArgumentError -> %{}
+  end
+
+  @doc false
+  def __preferred_restart_claimer__(supervisor_name, %Meta{} = meta, opts \\ [])
+      when is_atom(supervisor_name) and is_list(opts) do
+    local_node = Keyword.get(opts, :local_node, Node.self())
+    now = Keyword.get(opts, :now, System.system_time(:millisecond))
+    gate_config = Keyword.get(opts, :gate_config, restart_claim_gate_config(supervisor_name))
+    gate_first_seen_at = Keyword.get(opts, :gate_first_seen_at, now)
+    local_candidate_batch_size = Keyword.get(opts, :local_candidate_batch_size)
+    local_tail_bypass_threshold = Keyword.get(opts, :local_tail_bypass_threshold)
+
+    preferred_restart_claimer?(
+      supervisor_name,
+      meta,
+      gate_config,
+      local_node,
+      now,
+      gate_first_seen_at,
+      local_candidate_batch_size,
+      local_tail_bypass_threshold
+    )
+  end
+
+  @doc false
+  def __restart_claim_ttl_ms__(restart_start_timeout_ms)
+      when is_integer(restart_start_timeout_ms) and restart_start_timeout_ms > 0 do
+    restart_claim_ttl_ms(restart_start_timeout_ms)
+  end
+
+  @doc false
+  def __clear_restart_attempt_after_failure__(reason) do
+    clear_restart_attempt_after_failure?(reason)
+  end
+
+  @doc false
+  def __restart_claim_diag_key__(result) do
+    restart_claim_diag_key(result)
+  end
+
+  @doc false
+  def __restart_start_diag_key__(result) do
+    restart_start_diag_key(result)
+  end
+
+  @doc false
+  def report_diagnostic(supervisor_name, key, count \\ 1)
+      when is_atom(supervisor_name) and is_integer(count) and count > 0 do
+    # Guardrail: reject high-cardinality diagnostic keys (e.g. node strings).
+    # We keep aggregate atoms and bounded reason tuples such as
+    # {:remote_placement_erpc_error, :timeout}.
+    if high_cardinality_diag_key?(key) do
+      :ok
+    else
+      table_name = discovery_diagnostics_table_name(supervisor_name)
+
+      case :ets.whereis(table_name) do
+        :undefined ->
+          :ok
+
+        _ ->
+          :ets.update_counter(table_name, key, {2, count}, {key, 0})
+          :ok
+      end
+    end
+  rescue
+    ArgumentError -> :ok
+  end
+
+  defp high_cardinality_diag_key?(key) when is_tuple(key) do
+    key
+    |> Tuple.to_list()
+    |> Enum.any?(&is_binary/1)
+  end
+
+  defp high_cardinality_diag_key?(_), do: false
+
+  def stop_discovery(supervisor_name) do
+    GenServer.call(name(supervisor_name), :stop_discovery)
+  end
+
+  @impl true
+  def init(opts) do
+    supervisor_name = Keyword.fetch!(opts, :supervisor_name)
+    task_supervisor = Keyword.fetch!(opts, :task_supervisor)
+    circuit_breaker = Keyword.fetch!(opts, :circuit_breaker)
+
+    object_store =
+      case Keyword.get(opts, :storage_backend, Keyword.get(opts, :object_store)) do
+        %StorageBackend{} = backend ->
+          backend
+
+        %ObjectStore{} = store ->
+          StorageBackend.new(DurableServer.Backends.ObjectStore, store)
+
+        nil ->
+          raise ArgumentError, "LifecycleManager requires :storage_backend or :object_store"
+      end
+
+    heartbeat_store =
+      case Keyword.get(
+             opts,
+             :heartbeat_backend,
+             Keyword.get(opts, :heartbeat_store, object_store)
+           ) do
+        %StorageBackend{} = backend ->
+          backend
+
+        %ObjectStore{} = store ->
+          StorageBackend.new(DurableServer.Backends.ObjectStore, store)
+
+        nil ->
+          object_store
+      end
+
+    capacity_limits = Keyword.get(opts, :capacity_limits, %{})
+    heartbeat_meta = Keyword.get(opts, :heartbeat_meta)
+
+    heartbeat_watchdog =
+      Keyword.get(
+        opts,
+        :heartbeat_watchdog,
+        DurableServer.Supervisor.heartbeat_watchdog_name(supervisor_name)
+      )
+
+    config =
+      opts
+      |> Keyword.get(:config, %{
+        discovery_interval_ms: 60_000,
+        initial_discovery_delay_ms: @default_initial_discovery_delay_ms,
+        discovery_shuffle_batch_size: @default_discovery_shuffle_batch_size,
+        parallel_restart_batch_size: @default_parallel_restart_batch_size,
+        restart_start_timeout_ms: @default_restart_start_timeout_ms,
+        restart_claim_preferred_fanout: @restart_claim_preferred_fanout,
+        restart_claim_expanded_fanout: @restart_claim_expanded_fanout,
+        restart_claim_gate_expand_after_ms: @restart_claim_gate_expand_after_ms,
+        restart_claim_gate_disable_after_ms: @restart_claim_gate_disable_after_ms,
+        heartbeat_interval_ms: 10_000,
+        heartbeat_staleness_threshold_ms: @default_heartbeat_staleness_threshold_ms,
+        heartbeat_tracking_mode: :poll,
+        heartbeat_reconcile_interval_ms: 10_000,
+        prefix: "test/"
+      })
+      |> Map.put_new(:initial_discovery_delay_ms, @default_initial_discovery_delay_ms)
+      |> Map.put_new(:discovery_shuffle_batch_size, @default_discovery_shuffle_batch_size)
+      |> Map.put_new(:parallel_restart_batch_size, @default_parallel_restart_batch_size)
+      |> Map.put_new(:restart_start_timeout_ms, @default_restart_start_timeout_ms)
+      |> Map.put_new(:restart_claim_preferred_fanout, @restart_claim_preferred_fanout)
+      |> Map.put_new(:restart_claim_expanded_fanout, @restart_claim_expanded_fanout)
+      |> Map.put_new(:restart_claim_gate_expand_after_ms, @restart_claim_gate_expand_after_ms)
+      |> Map.put_new(:restart_claim_gate_disable_after_ms, @restart_claim_gate_disable_after_ms)
+      |> Map.put_new(:heartbeat_staleness_threshold_ms, @default_heartbeat_staleness_threshold_ms)
+      |> Map.put_new(:heartbeat_tracking_mode, :poll)
+      |> Map.put_new(:heartbeat_reconcile_interval_ms, 10_000)
+
+    validate_discovery_config!(config)
+
+    hearbeat_tab = heartbeat_table_name(supervisor_name)
+    :ets.new(hearbeat_tab, [:set, :public, :named_table, read_concurrency: true])
+
+    skip_tab = :"durable_server_discovery_skip_#{supervisor_name}"
+    :ets.new(skip_tab, [:set, :public, :named_table])
+
+    restart_gate_tab = restart_gate_table_name(supervisor_name)
+
+    :ets.new(restart_gate_tab, [
+      :set,
+      :public,
+      :named_table,
+      read_concurrency: true,
+      write_concurrency: true
+    ])
+
+    diagnostics_tab = discovery_diagnostics_table_name(supervisor_name)
+
+    :ets.new(diagnostics_tab, [
+      :set,
+      :public,
+      :named_table,
+      read_concurrency: true,
+      write_concurrency: true
+    ])
+
+    state = %LifecycleManager{
+      supervisor_name: supervisor_name,
+      task_sup: task_supervisor,
+      config: config,
+      circuit_breaker: circuit_breaker,
+      object_store: object_store,
+      heartbeat_store: heartbeat_store,
+      prefix: config.prefix,
+      node_module: Keyword.get(opts, :node_module, Node),
+      current_discovery_task: nil,
+      current_heartbeat_task: nil,
+      heartbeat_table: hearbeat_tab,
+      discovery_interval_ms: config.discovery_interval_ms,
+      initial_discovery_delay_ms: config.initial_discovery_delay_ms,
+      heartbeat_interval_ms: config.heartbeat_interval_ms,
+      heartbeat_tracking_mode: config.heartbeat_tracking_mode,
+      heartbeat_reconcile_interval_ms: config.heartbeat_reconcile_interval_ms,
+      capacity_limits: capacity_limits,
+      heartbeat_meta: heartbeat_meta,
+      heartbeat_watchdog: heartbeat_watchdog,
+      discovery_diag_table: diagnostics_tab,
+      discovery_skip_table: skip_tab,
+      restart_gate_table: restart_gate_tab,
+      discovery_burst_remaining: Map.get(config, :discovery_burst_count, 0),
+      discovery_shuffle_batch_size: config.discovery_shuffle_batch_size,
+      parallel_restart_batch_size: config.parallel_restart_batch_size,
+      restart_start_timeout_ms: config.restart_start_timeout_ms,
+      restart_claim_preferred_fanout: config.restart_claim_preferred_fanout,
+      restart_claim_expanded_fanout: config.restart_claim_expanded_fanout,
+      restart_claim_gate_expand_after_ms: config.restart_claim_gate_expand_after_ms,
+      restart_claim_gate_disable_after_ms: config.restart_claim_gate_disable_after_ms
+    }
+
+    :ok =
+      :pg.join(
+        DurableServer.Supervisor.presence_pg_scope(supervisor_name),
+        DurableServer.Supervisor.__supervisor_presence_group__(supervisor_name),
+        self()
+      )
+
+    # schedule periodic resource checks if limits configured
+    # run immediately to populate metrics, then schedule periodic checks
+    state =
+      if capacity_limits != %{} do
+        Process.send_after(self(), :check_resources, @resource_check_interval_ms)
+        update_resource_metrics(state)
+      else
+        state
+      end
+
+    # start with a configured delay/jitter window to spread out discovery across nodes
+    discovery_delay = initial_discovery_delay_ms(config.initial_discovery_delay_ms)
+    Process.send_after(self(), :discover_and_restart, discovery_delay)
+
+    Process.send_after(self(), :heartbeat, config.heartbeat_interval_ms)
+    Process.send_after(self(), :sweep_discovery_skip_set, @discovery_skip_sweep_interval_ms)
+
+    state = maybe_start_heartbeat_subscription(state)
+
+    if state.heartbeat_tracking_mode == :subscribe do
+      Process.send_after(self(), :heartbeat_reconcile, state.heartbeat_reconcile_interval_ms)
+    end
+
+    # we MUST start with a populated node heartbeat cache
+    # perform_heartbeat writes our heartbeat and refreshes the node health cache
+    {timing, heartbeat_entry} = perform_heartbeat(state, refresh_cache?: true)
+
+    # Join Group with heartbeat data so other nodes see us instantly via peer_connect.
+    # S3 is the source of truth for liveness; Group is the fast path for discovery.
+    join_group_heartbeat(state, heartbeat_entry)
+
+    :ok =
+      HeartbeatWatchdog.arm(
+        state.heartbeat_watchdog,
+        self(),
+        heartbeat_entry_timestamp(heartbeat_entry),
+        heartbeat_hard_deadline_ms(state)
+      )
+
+    {:ok,
+     %{
+       state
+       | last_successful_heartbeat_at: heartbeat_entry_timestamp(heartbeat_entry),
+         last_heartbeat_timing: timing
+     }}
+  end
+
+  @impl true
+  def handle_info(:heartbeat, %LifecycleManager{} = state) do
+    now = System.system_time(:millisecond)
+    deadline_ms = heartbeat_hard_deadline_ms(state)
+    deadline_at = state.last_successful_heartbeat_at + deadline_ms
+
+    # Check if we've already exceeded the deadline
+    if now >= deadline_at do
+      log(state, :error, fn ->
+        "heartbeat deadline already exceeded before starting task, stopping supervisor tree"
+      end)
+
+      {:stop, {:heartbeat_deadline_exceeded, state.last_successful_heartbeat_at}, state}
+    else
+      owner = self()
+      heartbeat_watchdog = state.heartbeat_watchdog
+
+      task =
+        Task.Supervisor.async(state.task_sup, fn ->
+          :ok = HeartbeatWatchdog.track_heartbeat_task(heartbeat_watchdog, owner, self())
+          {timing, heartbeat_entry} = perform_heartbeat(state)
+
+          HeartbeatWatchdog.renew(
+            heartbeat_watchdog,
+            owner,
+            heartbeat_entry_timestamp(heartbeat_entry)
+          )
+
+          {:heartbeat, {timing, heartbeat_entry}}
+        end)
+
+      {:noreply, %{state | current_heartbeat_task: task}}
+    end
+  end
+
+  def handle_info(:check_resources, %LifecycleManager{} = state) do
+    new_state = update_resource_metrics(state)
+    Process.send_after(self(), :check_resources, @resource_check_interval_ms)
+
+    {:noreply, new_state}
+  end
+
+  def handle_info(:sweep_discovery_skip_set, %LifecycleManager{} = state) do
+    expire_before = System.monotonic_time(:millisecond) - @discovery_skip_ttl_ms
+
+    expired =
+      :ets.select_delete(state.discovery_skip_table, [
+        {{:_, :_, :_, :"$1"}, [{:<, :"$1", expire_before}], [true]}
+      ])
+
+    if expired > 0 do
+      log(state, :debug, fn ->
+        "Swept #{expired} expired entries from discovery skip set"
+      end)
+    end
+
+    gate_expired =
+      :ets.select_delete(state.restart_gate_table, [
+        {{:_, :_, :"$1"}, [{:<, :"$1", expire_before}], [true]}
+      ])
+
+    if gate_expired > 0 do
+      log(state, :debug, fn ->
+        "Swept #{gate_expired} expired entries from restart gate state"
+      end)
+    end
+
+    Process.send_after(self(), :sweep_discovery_skip_set, @discovery_skip_sweep_interval_ms)
+    {:noreply, state}
+  end
+
+  def handle_info(
+        :heartbeat_reconcile,
+        %LifecycleManager{heartbeat_tracking_mode: :subscribe} = state
+      ) do
+    Task.Supervisor.start_child(state.task_sup, fn ->
+      case refresh_node_heartbeat_cache(state) do
+        {:ok, _count, _cleaned_count, error_count} when error_count > 0 ->
+          log(state, :warning, fn ->
+            "Heartbeat reconcile observed #{error_count} heartbeat fetch error(s)"
+          end)
+
+        {:ok, _count, _cleaned_count, _error_count} ->
+          :ok
+      end
+    end)
+
+    Process.send_after(self(), :heartbeat_reconcile, state.heartbeat_reconcile_interval_ms)
+    {:noreply, state}
+  end
+
+  def handle_info(:heartbeat_reconcile, %LifecycleManager{} = state) do
+    {:noreply, state}
+  end
+
+  def handle_info({:durable_server_storage_events, events}, %LifecycleManager{} = state)
+      when is_list(events) do
+    apply_storage_heartbeat_events(state, events)
+    {:noreply, state}
+  end
+
+  def handle_info(:discover_and_restart, %LifecycleManager{discovery_stopped: true} = state) do
+    {:noreply, state}
+  end
+
+  def handle_info(:discover_and_restart, %LifecycleManager{} = state) do
+    with %Task{ref: ref} <- state.current_discovery_task do
+      Process.demonitor(ref, [:flush])
+    end
+
+    task =
+      Task.Supervisor.async(state.task_sup, fn ->
+        {:discover, discover_and_restart_servers(state)}
+      end)
+
+    {:noreply, %{state | current_discovery_task: task}}
+  end
+
+  def handle_info(
+        {ref, {:discover, :ok}},
+        %LifecycleManager{} = state
+      ) do
+    # discovery task completed successfully, schedule next run
+    case state do
+      %LifecycleManager{current_discovery_task: %Task{ref: ^ref}} ->
+        Process.demonitor(ref, [:flush])
+        state = %{state | current_discovery_task: nil}
+
+        state =
+          if state.discovery_stopped do
+            state
+          else
+            {delay, state} = next_discovery_delay(state)
+            Process.send_after(self(), :discover_and_restart, delay)
+            state
+          end
+
+        {:noreply, state}
+
+      %LifecycleManager{} ->
+        {:noreply, state}
+    end
+  end
+
+  def handle_info(
+        {ref, {:heartbeat, {timing, heartbeat_entry}}},
+        %LifecycleManager{current_heartbeat_task: %Task{ref: ref}} = state
+      ) do
+    # heartbeat task completed successfully and already renewed the watchdog directly.
+    Process.demonitor(ref, [:flush])
+    Process.send_after(self(), :heartbeat, state.heartbeat_interval_ms)
+
+    # Update Group PG membership with fresh heartbeat data.
+    # This must run in the LM process (not the task) so the PG entry is owned by the LM pid.
+    join_group_heartbeat(state, heartbeat_entry)
+
+    # Log timing at info level if heartbeat took longer than expected (>5s)
+    if timing.total_ms > 5000 do
+      log(state, :warning, fn ->
+        "heartbeat completed but took #{timing.total_ms}ms (put: #{timing.put_ms}ms, cache: #{timing.cache_ms}ms)"
+      end)
+    end
+
+    {:noreply,
+     %{
+       state
+       | current_heartbeat_task: nil,
+         last_successful_heartbeat_at: heartbeat_entry_timestamp(heartbeat_entry),
+         last_heartbeat_timing: timing
+     }}
+  end
+
+  def handle_info(
+        {:DOWN, ref, :process, _pid, reason},
+        %LifecycleManager{current_discovery_task: %Task{ref: ref}} = state
+      ) do
+    # discovery task crashed or failed, still schedule next run but log the error
+    log(state, :error, fn -> "discovery task failed: #{inspect(reason)}" end)
+    :ets.delete_all_objects(state.discovery_skip_table)
+    :ets.delete_all_objects(state.restart_gate_table)
+    state = %{state | current_discovery_task: nil}
+    {delay, state} = next_discovery_delay(state)
+    Process.send_after(self(), :discover_and_restart, delay)
+    {:noreply, state}
+  end
+
+  def handle_info(
+        {:DOWN, ref, :process, _pid, reason},
+        %LifecycleManager{current_heartbeat_task: %Task{ref: ref}} = state
+      ) do
+    # Heartbeat task crashed - we must fail the supervisor tree (one_for_all) because
+    # our children will become orphan claimable if we can't write heartbeats.
+    # If we continue running, other nodes will claim our children as orphaned,
+    # allowing split brain scenario
+    log(state, :error, fn ->
+      "heartbeat task failed, stopping supervisor tree: #{inspect(reason)}"
+    end)
+
+    {:stop, {:heartbeat_failed, reason}, state}
+  end
+
+  @impl true
+  def handle_call(:stop_discovery, _from, %LifecycleManager{} = state) do
+    state =
+      case state.current_discovery_task do
+        %Task{} = task ->
+          Task.shutdown(task, :brutal_kill)
+          %{state | current_discovery_task: nil}
+
+        nil ->
+          state
+      end
+
+    # Mark as shutting down in ETS so check_capacity rejects remote placements
+    %{ets_table: table_name} =
+      DurableServer.Supervisor.__get_config__(state.supervisor_name)
+
+    :ets.insert(table_name, {:shutting_down, true})
+
+    state = %{state | discovery_stopped: true, discovery_burst_remaining: 0}
+
+    # Publish a draining heartbeat immediately so peers stop routing remote placements here
+    # without waiting for the next periodic heartbeat tick.
+    state =
+      case write_node_heartbeat(state) do
+        {:ok, heartbeat_entry} ->
+          HeartbeatWatchdog.renew(
+            state.heartbeat_watchdog,
+            self(),
+            heartbeat_entry_timestamp(heartbeat_entry)
+          )
+
+          join_group_heartbeat(state, heartbeat_entry)
+          %{state | last_successful_heartbeat_at: heartbeat_entry_timestamp(heartbeat_entry)}
+
+        {:error, reason} ->
+          log(state, :warning, fn ->
+            "Failed to write draining heartbeat during stop_discovery: #{inspect(reason)}"
+          end)
+
+          state
+      end
+
+    {:reply, :ok, state}
+  end
+
+  def handle_call(:get_heartbeat_metrics, _from, %LifecycleManager{} = state) do
+    resources = calculate_resource_map(state.supervisor_name)
+    capacity = DurableServer.Supervisor.current_capacity(state.supervisor_name)
+    heartbeat_meta = resolve_heartbeat_meta(state.heartbeat_meta)
+
+    metrics = %{
+      node: Node.self(),
+      last_heartbeat_timing: state.last_heartbeat_timing,
+      last_successful_heartbeat_at: state.last_successful_heartbeat_at,
+      heartbeat_interval_ms: state.heartbeat_interval_ms,
+      heartbeat_staleness_threshold_ms: heartbeat_staleness_threshold_ms(state),
+      deadline_ms: heartbeat_hard_deadline_ms(state),
+      resources: resources,
+      capacity: capacity,
+      heartbeat_meta: heartbeat_meta
+    }
+
+    {:reply, metrics, state}
+  end
+
+  @impl true
+  def terminate(_reason, %LifecycleManager{} = state) do
+    HeartbeatWatchdog.disarm(state.heartbeat_watchdog, self())
+    _ = maybe_delete_own_heartbeat(state)
+    _ = maybe_stop_heartbeat_subscription(state)
+    :ok
+  end
+
+  defp perform_heartbeat(%LifecycleManager{} = state, opts \\ []) do
+    opts = Keyword.validate!(opts, [:refresh_cache?])
+    refresh_cache? = Keyword.get(opts, :refresh_cache?, state.heartbeat_tracking_mode == :poll)
+    start_time = System.monotonic_time(:millisecond)
+
+    # Do the critical heartbeat PUT inline
+    put_start = System.monotonic_time(:millisecond)
+
+    heartbeat_entry =
+      case write_node_heartbeat(state) do
+        {:ok, entry} ->
+          log(state, :debug, fn ->
+            put_duration = System.monotonic_time(:millisecond) - put_start
+            "Node heartbeat written successfully in #{put_duration}ms"
+          end)
+
+          entry
+
+        {:error, reason} ->
+          put_duration = System.monotonic_time(:millisecond) - put_start
+
+          # we must fail the DurableSupervisor tree (one_for_all) if we fail to heartbeat because our
+          # children will become orphan claimable and if we can't reach object storage we are in a failed state
+          raise RuntimeError,
+                "failed to write node heartbeat before deadline (#{put_duration}ms elapsed): #{inspect(reason)}"
+      end
+
+    put_duration = System.monotonic_time(:millisecond) - put_start
+
+    cache_duration =
+      if refresh_cache? do
+        refresh_heartbeat_cache_with_timing!(state)
+      else
+        0
+      end
+
+    :ok = CircuitBreaker.prune_stale_entries(state.circuit_breaker)
+
+    total_duration = System.monotonic_time(:millisecond) - start_time
+
+    {%{put_ms: put_duration, cache_ms: cache_duration, total_ms: total_duration}, heartbeat_entry}
+  end
+
+  defp refresh_heartbeat_cache_with_timing!(%LifecycleManager{} = state) do
+    cache_start = System.monotonic_time(:millisecond)
+    cache_result = refresh_node_heartbeat_cache(state)
+    cache_duration = System.monotonic_time(:millisecond) - cache_start
+
+    case cache_result do
+      {:ok, _count, _cleaned_count, error_count} when error_count > 0 ->
+        # A partial view of the cluster is dangerous - we could incorrectly treat
+        # healthy nodes as expired and steal their locks
+        raise RuntimeError,
+              "failed to refresh heartbeat cache: #{error_count} heartbeat fetch errors"
+
+      {:ok, count, cleaned_count, _error_count} when cleaned_count > 0 ->
+        log(state, :debug, fn ->
+          "Refreshed heartbeat cache with #{count} nodes, cleaned up #{cleaned_count} dead nodes in #{cache_duration}ms"
+        end)
+
+        cache_duration
+
+      {:ok, count, _cleaned_count, _error_count} ->
+        log(state, :debug, fn ->
+          "Refreshed heartbeat cache with #{count} nodes in #{cache_duration}ms"
+        end)
+
+        cache_duration
+    end
+  end
+
+  defp maybe_start_heartbeat_subscription(
+         %LifecycleManager{heartbeat_tracking_mode: :subscribe} = state
+       ) do
+    heartbeat_prefix = "#{state.prefix}__nodes/"
+
+    case StorageBackend.subscribe(state.heartbeat_store, self(), heartbeat_prefix) do
+      {:ok, subscription_ref} ->
+        %{state | heartbeat_subscription_ref: subscription_ref}
+
+      {:error, :unsupported} ->
+        log(state, :warning, fn ->
+          "heartbeat_tracking_mode=:subscribe requested but backend does not support subscriptions, falling back to :poll"
+        end)
+
+        %{state | heartbeat_tracking_mode: :poll}
+
+      {:error, reason} ->
+        raise RuntimeError, "failed to subscribe heartbeat stream: #{inspect(reason)}"
+    end
+  end
+
+  defp maybe_start_heartbeat_subscription(%LifecycleManager{} = state), do: state
+
+  defp maybe_stop_heartbeat_subscription(
+         %LifecycleManager{heartbeat_subscription_ref: nil} = _state
+       ),
+       do: :ok
+
+  defp maybe_stop_heartbeat_subscription(%LifecycleManager{} = state) do
+    StorageBackend.unsubscribe(state.heartbeat_store, state.heartbeat_subscription_ref)
+  rescue
+    _ -> :ok
+  end
+
+  defp maybe_delete_own_heartbeat(%LifecycleManager{} = state) do
+    if state.discovery_stopped or supervisor_shutting_down?(state.supervisor_name) do
+      node_str = to_string(Node.self())
+      key = "#{state.prefix}__nodes/#{node_str}"
+
+      :ets.delete(state.heartbeat_table, node_str)
+
+      case StorageBackend.delete_object(state.heartbeat_store, key) do
+        :ok ->
+          :ok
+
+        {:error, :not_found} ->
+          :ok
+
+        {:error, reason} ->
+          log(state, :warning, fn ->
+            "Failed to delete local heartbeat during shutdown: #{inspect(reason)}"
+          end)
+
+          :ok
+      end
+    else
+      :ok
+    end
+  rescue
+    _ -> :ok
+  end
+
+  defp apply_storage_heartbeat_events(%LifecycleManager{} = state, events) when is_list(events) do
+    Enum.each(events, fn
+      %{type: :put, key: key, value: value} ->
+        apply_storage_heartbeat_put(state, key, value)
+
+      %{type: :delete, key: key} ->
+        apply_storage_heartbeat_delete(state, key)
+
+      _ ->
+        :ok
+    end)
+  end
+
+  defp apply_storage_heartbeat_put(%LifecycleManager{} = state, key, value)
+       when is_binary(key) do
+    if heartbeat_key_for_supervisor?(state, key) do
+      case parse_heartbeat_data(value) do
+        {:ok, heartbeat_tuple} ->
+          :ets.insert(state.heartbeat_table, heartbeat_tuple)
+
+        {:error, :invalid_format} ->
+          :ok
+      end
+    end
+  end
+
+  defp apply_storage_heartbeat_put(%LifecycleManager{} = _state, _key, _value), do: :ok
+
+  defp apply_storage_heartbeat_delete(%LifecycleManager{} = state, key) when is_binary(key) do
+    nodes_prefix = "#{state.prefix}__nodes/"
+
+    if String.starts_with?(key, nodes_prefix) do
+      node_str = String.trim_leading(key, nodes_prefix)
+
+      if node_str != "" do
+        :ets.delete(state.heartbeat_table, node_str)
+      end
+    end
+  end
+
+  defp apply_storage_heartbeat_delete(%LifecycleManager{} = _state, _key), do: :ok
+
+  defp heartbeat_key_for_supervisor?(%LifecycleManager{} = state, key) when is_binary(key) do
+    String.starts_with?(key, "#{state.prefix}__nodes/")
+  end
+
+  defp log(%LifecycleManager{} = state, level, func)
+       when is_atom(level) and is_function(func, 0) do
+    Logger.log(level, fn -> inspect(state.supervisor_name) <> ": " <> func.() end)
+  end
+
+  # Calculate the hard deadline for heartbeat operations.
+  # We must complete heartbeat before other nodes consider us stale (orphan claimable).
+  defp heartbeat_hard_deadline_ms(%LifecycleManager{} = state) do
+    heartbeat_staleness_threshold_ms(state) - @heartbeat_deadline_buffer_ms
+  end
+
+  # this gets run async inside a task
+  defp write_node_heartbeat(%LifecycleManager{} = state) do
+    node_str = to_string(Node.self())
+    node_ref = DurableServer.Supervisor.node_ref(state.supervisor_name)
+    current_time = System.system_time(:millisecond)
+
+    # calculate capacity and resource info
+    capacity = DurableServer.Supervisor.current_capacity(state.supervisor_name)
+    resources = calculate_resource_map(state.supervisor_name)
+
+    # collect env vars used by sticky placement configs
+    env_var_names =
+      DurableServer.Supervisor.collect_sticky_placement_env_vars(state.supervisor_name)
+
+    env_vars =
+      env_var_names
+      |> Enum.map(fn var_name -> {var_name, System.get_env(var_name)} end)
+      |> Enum.into(%{})
+
+    # resolve heartbeat_meta (can be a map or a function that returns a map)
+    # and add a draining marker while this supervisor is shutting down.
+    heartbeat_meta =
+      state.heartbeat_meta
+      |> resolve_heartbeat_meta()
+      |> maybe_apply_placement_region(state.config)
+      |> maybe_mark_draining(state.supervisor_name)
+
+    heartbeat_data =
+      %{
+        "node" => node_str,
+        "node_ref" => node_ref,
+        "last_heartbeat_at" => current_time
+      }
+      |> maybe_put("capacity", normalize_heartbeat_term(capacity))
+      |> maybe_put("resources", normalize_heartbeat_term(resources))
+      |> maybe_put("env_vars", normalize_heartbeat_term(env_vars))
+      |> maybe_put("heartbeat_meta", normalize_heartbeat_term(heartbeat_meta))
+
+    key = "#{state.prefix}__nodes/#{node_str}"
+    entry = {node_str, node_ref, current_time, capacity, resources, env_vars, heartbeat_meta}
+
+    deadline_at = heartbeat_deadline_at(state, state.last_successful_heartbeat_at)
+
+    case put_heartbeat_until_deadline(state, key, heartbeat_data, deadline_at) do
+      {:ok, _} ->
+        # update local ets cache with full capacity info
+        :ets.insert(state.heartbeat_table, entry)
+
+        {:ok, entry}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp put_heartbeat_until_deadline(%LifecycleManager{} = state, key, heartbeat_data, deadline_at) do
+    do_put_heartbeat_until_deadline(state, key, heartbeat_data, deadline_at, 0)
+  end
+
+  defp do_put_heartbeat_until_deadline(
+         %LifecycleManager{} = state,
+         key,
+         heartbeat_data,
+         deadline_at,
+         attempt
+       ) do
+    remaining_ms = max(deadline_at - System.system_time(:millisecond), 0)
+
+    if remaining_ms <= 0 do
+      {:error, :heartbeat_deadline_exceeded}
+    else
+      # Give the backend one long write attempt using the remaining heartbeat budget.
+      # The outer LM retry loop handles fast-fail transient errors without compounding
+      # backend retries inside the same deadline window.
+      put_opts = [max_retries: 0, timeout: remaining_ms]
+
+      case StorageBackend.put_object(state.heartbeat_store, key, heartbeat_data, put_opts) do
+        {:ok, _} = ok ->
+          ok
+
+        {:error, reason} ->
+          if heartbeat_write_retryable?(reason) do
+            sleep_ms = min(heartbeat_write_backoff_ms(attempt), remaining_ms)
+
+            if sleep_ms > 0 do
+              Process.sleep(sleep_ms)
+            end
+
+            do_put_heartbeat_until_deadline(state, key, heartbeat_data, deadline_at, attempt + 1)
+          else
+            {:error, reason}
+          end
+      end
+    end
+  end
+
+  defp heartbeat_deadline_at(%LifecycleManager{} = state, nil),
+    do: System.system_time(:millisecond) + heartbeat_hard_deadline_ms(state)
+
+  defp heartbeat_deadline_at(%LifecycleManager{} = state, last_successful_heartbeat_at)
+       when is_integer(last_successful_heartbeat_at) do
+    last_successful_heartbeat_at + heartbeat_hard_deadline_ms(state)
+  end
+
+  defp heartbeat_entry_timestamp(
+         {_node_str, _node_ref, timestamp, _capacity, _resources, _env_vars, _heartbeat_meta}
+       )
+       when is_integer(timestamp) do
+    timestamp
+  end
+
+  defp heartbeat_write_retryable?({:mirror_failed, reason}),
+    do: heartbeat_write_retryable?(reason)
+
+  defp heartbeat_write_retryable?(reason) do
+    reason in [
+      :no_quorum,
+      :quorum_timeout,
+      :unavailable,
+      :cluster_overflow,
+      :cluster_not_ready,
+      :timeout
+    ]
+  end
+
+  defp heartbeat_write_backoff_ms(attempt) do
+    backoff_for_range(@heartbeat_write_retry_backoff_ms, attempt)
+  end
+
+  defp backoff_for_range({min_ms, max_ms}, _attempt) when min_ms == max_ms, do: min_ms
+
+  defp backoff_for_range({min_ms, max_ms}, _attempt) do
+    :rand.uniform(max_ms - min_ms + 1) + min_ms - 1
+  end
+
+  defp resolve_heartbeat_meta(nil), do: %{}
+  defp resolve_heartbeat_meta(%{} = map), do: normalize_heartbeat_meta_keys(map)
+
+  defp resolve_heartbeat_meta(func) when is_function(func, 0) do
+    case func.() do
+      %{} = map ->
+        normalize_heartbeat_meta_keys(map)
+
+      other ->
+        raise ArgumentError,
+              "heartbeat_meta function must return a map, got: #{inspect(other)}"
+    end
+  end
+
+  defp maybe_apply_placement_region(heartbeat_meta, %{placement_region: region})
+       when is_map(heartbeat_meta) and is_binary(region) and region != "" do
+    Map.put(heartbeat_meta, "placement_region", region)
+  end
+
+  defp maybe_apply_placement_region(%{} = heartbeat_meta, _),
+    do: Map.delete(heartbeat_meta, "placement_region")
+
+  defp maybe_mark_draining(heartbeat_meta, supervisor_name) when is_atom(supervisor_name) do
+    if supervisor_shutting_down?(supervisor_name) do
+      (heartbeat_meta || %{}) |> Map.put("draining", true)
+    else
+      heartbeat_meta
+    end
+  end
+
+  defp normalize_heartbeat_meta_keys(%{} = heartbeat_meta) do
+    Enum.into(heartbeat_meta, %{}, fn
+      {key, value} when is_atom(key) -> {Atom.to_string(key), value}
+      {key, value} -> {key, value}
+    end)
+  end
+
+  defp supervisor_shutting_down?(supervisor_name) when is_atom(supervisor_name) do
+    %{ets_table: table_name} = DurableServer.Supervisor.__get_config__(supervisor_name)
+    match?([{:shutting_down, true}], :ets.lookup(table_name, :shutting_down))
+  rescue
+    _ -> false
+  end
+
+  # this gets run async inside a task
+  defp refresh_node_heartbeat_cache(%LifecycleManager{} = state) do
+    dead_node_threshold_ms = state.config.dead_node_threshold_ms
+    current_time = System.system_time(:millisecond)
+
+    entries =
+      StorageBackend.list_all_objects_stream(state.heartbeat_store, "#{state.prefix}__nodes/",
+        include_objects: true,
+        error_handler: fn reason ->
+          log(state, :warning, fn -> "List stream error: #{inspect(reason)}" end)
+          :continue
+        end
+      )
+      |> Enum.to_list()
+
+    results =
+      entries
+      |> Task.async_stream(
+        fn entry ->
+          process_heartbeat_list_entry(entry, state, current_time, dead_node_threshold_ms)
+        end,
+        max_concurrency: 20,
+        timeout: :timer.seconds(10),
+        on_timeout: :kill_task
+      )
+      |> Enum.map(fn
+        {:ok, result} -> result
+        {:exit, reason} -> {:task_error, reason}
+      end)
+
+    # Separate results into categories
+    {heartbeats, rest} =
+      Enum.split_with(results, fn
+        {:alive, _node, _node_ref, _timestamp, _capacity, _resources, _env_vars, _heartbeat_meta} ->
+          true
+
+        _ ->
+          false
+      end)
+
+    {missing_nodes, non_missing_rest} =
+      Enum.split_with(rest, fn
+        {:missing, _key} -> true
+        _ -> false
+      end)
+
+    {dead_nodes, errors} =
+      Enum.split_with(non_missing_rest, fn
+        {:dead, _key, _node, _node_ref, _timestamp} -> true
+        _ -> false
+      end)
+
+    # Log any errors
+    Enum.each(errors, fn
+      {:fetch_error, key, reason} ->
+        log(state, :warning, fn ->
+          "Failed to fetch heartbeat for #{key}: #{inspect(reason)}"
+        end)
+
+      {:task_error, reason} ->
+        log(state, :warning, fn ->
+          "Heartbeat fetch task failed: #{inspect(reason)}"
+        end)
+    end)
+
+    if missing_nodes != [] do
+      log(state, :debug, fn ->
+        "Skipped #{length(missing_nodes)} raced heartbeat key(s) during cache refresh"
+      end)
+    end
+
+    error_count = length(errors)
+
+    # extract heartbeat data for alive nodes
+    live_heartbeats =
+      Enum.map(heartbeats, fn {:alive, node, node_ref, timestamp, capacity, resources, env_vars,
+                               heartbeat_meta} ->
+        {node, node_ref, timestamp, capacity, resources, env_vars, heartbeat_meta}
+      end)
+
+    # attempt to clean up dead nodes (race conditions are OK, delete might fail)
+    cleaned_count =
+      dead_nodes
+      |> Enum.map(fn {:dead, key, node, _node_ref, _timestamp} ->
+        :ets.delete(state.heartbeat_table, node)
+
+        case StorageBackend.delete_object(state.heartbeat_store, key) do
+          :ok ->
+            log(state, :info, fn -> "Cleaned up dead node heartbeat: #{node}" end)
+            1
+
+          {:error, reason} ->
+            # race condition or other error - another node might have cleaned it up
+            log(state, :info, fn ->
+              "Failed to clean up dead node heartbeat #{inspect(node)}: #{inspect(reason)}"
+            end)
+
+            0
+        end
+      end)
+      |> Enum.sum()
+
+    :ets.insert(state.heartbeat_table, live_heartbeats)
+
+    {:ok, length(live_heartbeats), cleaned_count, error_count}
+  end
+
+  defp process_heartbeat_list_entry(
+         %{key: key, body: body},
+         _state,
+         current_time,
+         dead_node_threshold_ms
+       )
+       when is_binary(key) and is_integer(current_time) and is_integer(dead_node_threshold_ms) do
+    case parse_heartbeat_data(body) do
+      {:ok, {node, node_ref, timestamp, capacity, resources, env_vars, heartbeat_meta}} ->
+        if current_time - timestamp > dead_node_threshold_ms do
+          {:dead, key, node, node_ref, timestamp}
+        else
+          {:alive, node, node_ref, timestamp, capacity, resources, env_vars, heartbeat_meta}
+        end
+
+      {:error, :invalid_format} ->
+        {:fetch_error, key, :invalid_format}
+    end
+  end
+
+  defp process_heartbeat_list_entry(
+         %{key: key},
+         %LifecycleManager{} = state,
+         current_time,
+         dead_node_threshold_ms
+       )
+       when is_binary(key) and is_integer(current_time) and is_integer(dead_node_threshold_ms) do
+    case StorageBackend.get_object(state.heartbeat_store, key, consistent: false) do
+      {:ok, %{body: body}} ->
+        process_heartbeat_list_entry(
+          %{key: key, body: body},
+          state,
+          current_time,
+          dead_node_threshold_ms
+        )
+
+      {:error, :not_found} ->
+        # list/get race: key was removed after we listed it.
+        # This is expected during concurrent cleanup and should not fail heartbeat refresh.
+        {:missing, key}
+
+      {:error, reason} ->
+        {:fetch_error, key, reason}
+    end
+  end
+
+  defp heartbeat_table_name(supervisor_name) when is_atom(supervisor_name) do
+    :"durable_server_heartbeats_#{supervisor_name}"
+  end
+
+  defp discovery_diagnostics_table_name(supervisor_name) when is_atom(supervisor_name) do
+    :"durable_server_discovery_diag_#{supervisor_name}"
+  end
+
+  defp restart_gate_table_name(supervisor_name) when is_atom(supervisor_name) do
+    :"durable_server_restart_gate_#{supervisor_name}"
+  end
+
+  # Join the Group heartbeat PG key with our heartbeat metadata so other nodes
+  # discover us instantly via peer_connect (instead of waiting for S3 cache refresh).
+  # Must be called from the LM process so the PG entry is owned by the LM pid.
+  # Gracefully handles Group not being available (e.g., standalone LM tests).
+  defp join_group_heartbeat(
+         %LifecycleManager{supervisor_name: sup} = _state,
+         {node_str, node_ref, timestamp, capacity, resources, env_vars, heartbeat_meta}
+       ) do
+    meta = %{
+      node: node_str,
+      node_ref: node_ref,
+      timestamp: timestamp,
+      capacity: capacity,
+      resources: resources,
+      env_vars: env_vars,
+      heartbeat_meta: heartbeat_meta
+    }
+
+    try do
+      Group.join(sup, @heartbeat_group_key, meta)
+    rescue
+      _ -> :ok
+    catch
+      :exit, _ -> :ok
+    end
+  end
+
+  @doc """
+  Gets all cluster nodes from the heartbeat cache with their heartbeat metadata.
+
+  Returns a map of node names to node info maps containing heartbeat_meta.
+
+  ## Examples
+
+      iex> get_cluster_nodes(MyApp.DurableSupervisor)
+      %{
+        "node1@host" => %{heartbeat_meta: %{"region" => "ord"}},
+        "node2@host" => %{heartbeat_meta: nil}
+      }
+
+  """
+  def get_cluster_nodes(supervisor_name) when is_atom(supervisor_name) do
+    table_name = heartbeat_table_name(supervisor_name)
+
+    :ets.tab2list(table_name)
+    |> Enum.map(fn {node_str, _node_ref, _timestamp, _capacity, _resources, _env_vars,
+                    heartbeat_meta} ->
+      {node_str, %{heartbeat_meta: heartbeat_meta}}
+    end)
+    |> Enum.into(%{})
+  end
+
+  @doc """
+  Returns the node health as it exists in the heartbeat table cache.
+
+  Returns node health status with capacity and resource details:
+
+  - `{:healthy, %{node_ref: ref, capacity: map, resources: map}}` - Node is healthy with capacity info
+  - `:stale` - Node heartbeat is stale
+  - `:unknown` - Node not found in cache
+
+  The capacity map contains current vs limit for total (all modules) and per-module:
+  ```
+  %{
+    :total => %{current: 50, limit: 100},
+    MyApp.Server => %{current: 5, limit: 10}
+  }
+  ```
+
+  The resources map contains current metrics and the node's own thresholds:
+  ```
+  %{
+    cpu: 75.2,          # Current CPU %
+    max_cpu: 80,        # This node's configured threshold
+    memory: 67.8,       # Current memory %
+    max_memory: 85      # This node's configured threshold
+  }
+  ```
+
+  This allows remote nodes to make informed claiming decisions using the target
+  node's own configuration, which is important when nodes have heterogeneous
+  hardware (different CPU types, memory amounts).
+  """
+  def lookup_node_health(%Meta{supervisor: supervisor_name, node_str: node_str}) do
+    lookup_node_health(%{supervisor: supervisor_name, node_str: node_str})
+  end
+
+  def lookup_node_health(%{supervisor: supervisor_name, node_str: node_str})
+      when is_atom(supervisor_name) and is_binary(node_str) do
+    # Handle race condition where this is called via RPC on a node that just joined
+    # but hasn't fully initialized its supervisor/ETS tables yet
+    table_name = heartbeat_table_name(supervisor_name)
+
+    %{
+      heartbeat_staleness_threshold_ms: heartbeat_staleness_threshold_ms
+    } =
+      DurableServer.Supervisor.__get_config__(supervisor_name)
+
+    case :ets.lookup(table_name, node_str) do
+      [{^node_str, node_ref, timestamp, capacity, resources, env_vars, heartbeat_meta}] ->
+        current_time = System.system_time(:millisecond)
+
+        if current_time - timestamp > heartbeat_staleness_threshold_ms do
+          :stale
+        else
+          {:healthy,
+           %{
+             node_ref: node_ref,
+             capacity: capacity,
+             resources: resources,
+             env_vars: env_vars,
+             heartbeat_meta: heartbeat_meta
+           }}
+        end
+
+      # Node not found in heartbeat table
+      _ ->
+        :unknown
+    end
+  rescue
+    # Supervisor or ETS table doesn't exist yet (node still initializing)
+    RuntimeError -> :unknown
+    ArgumentError -> :unknown
+  end
+
+  @doc """
+  Fetch a node's heartbeat directly from object storage.
+
+  This is used as a fallback when the local heartbeat cache returns `:unknown`,
+  to avoid incorrectly treating a healthy node as expired just because we haven't
+  refreshed our cache since that node joined.
+
+  When a healthy heartbeat is fetched, it is also written to the local ETS cache
+  so subsequent lookups will find it without hitting storage.
+
+  Returns:
+  - `{:healthy, %{node_ref: node_ref}}` if heartbeat exists and is fresh
+  - `:stale` if heartbeat exists but is too old
+  - `:not_found` if no heartbeat exists for this node
+  - `{:error, reason}` on fetch failure
+  """
+  def fetch_node_heartbeat_from_storage(supervisor_name, node_str, opts \\ [])
+      when is_atom(supervisor_name) and is_binary(node_str) do
+    opts = Keyword.validate!(opts, [:consistent])
+    config = DurableServer.Supervisor.__get_config__(supervisor_name)
+    prefix = config.prefix
+    heartbeat_staleness_threshold_ms = config.heartbeat_staleness_threshold_ms
+    storage_backend = config.storage_backend
+    heartbeat_store = Map.get(config, :heartbeat_backend, storage_backend)
+
+    key = "#{prefix}__nodes/#{node_str}"
+
+    case StorageBackend.get_object(heartbeat_store, key, opts) do
+      {:ok, %{body: body}} ->
+        case parse_heartbeat_data(body) do
+          {:ok,
+           {_node_str, node_ref, timestamp, _capacity, _resources, _env_vars, _heartbeat_meta}} ->
+            current_time = System.system_time(:millisecond)
+
+            if current_time - timestamp > heartbeat_staleness_threshold_ms do
+              :stale
+            else
+              # Cache the fetched heartbeat so subsequent lookups are fast
+              cache_fetched_heartbeat(supervisor_name, body)
+              {:healthy, %{node_ref: node_ref}}
+            end
+
+          {:error, :invalid_format} ->
+            {:error, :invalid_heartbeat_format}
+        end
+
+      {:error, :not_found} ->
+        :not_found
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  rescue
+    RuntimeError -> {:error, :supervisor_not_ready}
+  end
+
+  # Cache a heartbeat fetched from storage into the local ETS table
+  defp cache_fetched_heartbeat(supervisor_name, data) do
+    case parse_heartbeat_data(data) do
+      {:ok, heartbeat_tuple} ->
+        table_name = heartbeat_table_name(supervisor_name)
+        :ets.insert(table_name, heartbeat_tuple)
+
+      {:error, :invalid_format} ->
+        :ok
+    end
+  rescue
+    # ETS table might not exist if supervisor is shutting down
+    ArgumentError -> :ok
+  end
+
+  defp next_discovery_delay(%LifecycleManager{discovery_burst_remaining: n} = state) when n > 0 do
+    {0, %{state | discovery_burst_remaining: n - 1}}
+  end
+
+  defp next_discovery_delay(%LifecycleManager{} = state) do
+    {state.discovery_interval_ms, state}
+  end
+
+  defp validate_discovery_config!(config) when is_map(config) do
+    case Map.fetch!(config, :initial_discovery_delay_ms) do
+      timeout when is_integer(timeout) and timeout >= 0 ->
+        :ok
+
+      {min_timeout, max_timeout}
+      when is_integer(min_timeout) and min_timeout >= 0 and is_integer(max_timeout) and
+             max_timeout >= min_timeout ->
+        :ok
+
+      other ->
+        raise ArgumentError,
+              "initial_discovery_delay_ms must be a non-negative integer or {min_ms, max_ms} tuple, got: #{inspect(other)}"
+    end
+
+    case Map.fetch!(config, :discovery_shuffle_batch_size) do
+      value when is_integer(value) and value > 0 ->
+        :ok
+
+      other ->
+        raise ArgumentError,
+              "discovery_shuffle_batch_size must be a positive integer, got: #{inspect(other)}"
+    end
+
+    case Map.fetch!(config, :parallel_restart_batch_size) do
+      value when is_integer(value) and value > 0 ->
+        :ok
+
+      other ->
+        raise ArgumentError,
+              "parallel_restart_batch_size must be a positive integer, got: #{inspect(other)}"
+    end
+
+    case Map.fetch!(config, :restart_start_timeout_ms) do
+      value when is_integer(value) and value > 0 ->
+        :ok
+
+      other ->
+        raise ArgumentError,
+              "restart_start_timeout_ms must be a positive integer, got: #{inspect(other)}"
+    end
+
+    case Map.fetch!(config, :restart_claim_preferred_fanout) do
+      value when is_integer(value) and value > 0 ->
+        :ok
+
+      other ->
+        raise ArgumentError,
+              "restart_claim_preferred_fanout must be a positive integer, got: #{inspect(other)}"
+    end
+
+    case Map.fetch!(config, :restart_claim_expanded_fanout) do
+      value when is_integer(value) and value > 0 ->
+        :ok
+
+      other ->
+        raise ArgumentError,
+              "restart_claim_expanded_fanout must be a positive integer, got: #{inspect(other)}"
+    end
+
+    if Map.fetch!(config, :restart_claim_expanded_fanout) <
+         Map.fetch!(config, :restart_claim_preferred_fanout) do
+      raise ArgumentError,
+            "restart_claim_expanded_fanout must be >= restart_claim_preferred_fanout"
+    end
+
+    case Map.fetch!(config, :restart_claim_gate_expand_after_ms) do
+      value when is_integer(value) and value >= 0 ->
+        :ok
+
+      other ->
+        raise ArgumentError,
+              "restart_claim_gate_expand_after_ms must be a non-negative integer, got: #{inspect(other)}"
+    end
+
+    case Map.fetch!(config, :restart_claim_gate_disable_after_ms) do
+      value when is_integer(value) and value >= 0 ->
+        :ok
+
+      other ->
+        raise ArgumentError,
+              "restart_claim_gate_disable_after_ms must be a non-negative integer, got: #{inspect(other)}"
+    end
+
+    if Map.fetch!(config, :restart_claim_gate_disable_after_ms) <
+         Map.fetch!(config, :restart_claim_gate_expand_after_ms) do
+      raise ArgumentError,
+            "restart_claim_gate_disable_after_ms must be >= restart_claim_gate_expand_after_ms"
+    end
+
+    case Map.fetch!(config, :heartbeat_staleness_threshold_ms) do
+      value when is_integer(value) and value > @heartbeat_deadline_buffer_ms ->
+        :ok
+
+      other ->
+        raise ArgumentError,
+              "heartbeat_staleness_threshold_ms must be an integer greater than #{@heartbeat_deadline_buffer_ms}, got: #{inspect(other)}"
+    end
+
+    max_heartbeat_interval = div(Map.fetch!(config, :heartbeat_staleness_threshold_ms), 2)
+
+    case Map.fetch!(config, :heartbeat_interval_ms) do
+      value when is_integer(value) and value > 0 and value <= max_heartbeat_interval ->
+        :ok
+
+      value when is_integer(value) and value > 0 ->
+        raise ArgumentError, """
+        Invalid heartbeat_interval_ms configuration: #{value}ms
+
+        heartbeat_interval_ms must be <= #{max_heartbeat_interval}ms (half of heartbeat_staleness_threshold_ms: #{Map.fetch!(config, :heartbeat_staleness_threshold_ms)}ms).
+
+        With the current value, nodes would be considered stale before they even
+        have a chance to send their next heartbeat, causing unnecessary failovers.
+        """
+
+      other ->
+        raise ArgumentError,
+              "heartbeat_interval_ms must be a positive integer, got: #{inspect(other)}"
+    end
+  end
+
+  defp initial_discovery_delay_ms(timeout) when is_integer(timeout) and timeout >= 0, do: timeout
+
+  defp initial_discovery_delay_ms({min_timeout, max_timeout})
+       when is_integer(min_timeout) and min_timeout >= 0 and is_integer(max_timeout) and
+              max_timeout >= min_timeout do
+    min_timeout + :rand.uniform(max_timeout - min_timeout + 1) - 1
+  end
+
+  defp heartbeat_staleness_threshold_ms(%LifecycleManager{} = state) do
+    Map.fetch!(state.config, :heartbeat_staleness_threshold_ms)
+  end
+
+  defp preferred_restart_claimer?(
+         supervisor_name,
+         %Meta{} = meta,
+         gate_config,
+         local_node,
+         now,
+         gate_first_seen_at,
+         local_candidate_batch_size,
+         local_tail_bypass_threshold
+       ) do
+    gate_first_seen_at =
+      case gate_first_seen_at do
+        value when is_integer(value) -> value
+        _ -> now
+      end
+
+    cond do
+      is_integer(local_candidate_batch_size) and
+        is_integer(local_tail_bypass_threshold) and
+        local_candidate_batch_size > 0 and
+        local_tail_bypass_threshold > 0 and
+          local_candidate_batch_size <= local_tail_bypass_threshold ->
+        report_diagnostic(supervisor_name, :restart_gate_bypass_small_local_batch)
+        true
+
+      true ->
+        case restart_claim_contention_fanout(gate_config, now, gate_first_seen_at) do
+          {:preferred, fanout} ->
+            report_diagnostic(supervisor_name, :restart_gate_fanout_preferred)
+            decide_restart_gate(supervisor_name, meta, gate_config, local_node, now, fanout)
+
+          {:expanded, fanout} ->
+            report_diagnostic(supervisor_name, :restart_gate_fanout_expanded)
+            decide_restart_gate(supervisor_name, meta, gate_config, local_node, now, fanout)
+
+          :all ->
+            report_diagnostic(supervisor_name, :restart_gate_fanout_all)
+            true
+        end
+    end
+  end
+
+  defp decide_restart_gate(supervisor_name, %Meta{} = meta, gate_config, local_node, now, fanout)
+       when is_integer(fanout) and fanout > 0 do
+    case eligible_restart_claim_nodes(supervisor_name, meta, gate_config, now) do
+      nodes when is_list(nodes) ->
+        cond do
+          length(nodes) < 2 ->
+            report_diagnostic(supervisor_name, :restart_gate_bypass_small_candidate_set)
+            true
+
+          not Enum.member?(nodes, local_node) ->
+            # The local restartability checks already said "yes". If this best-effort
+            # candidate set disagrees due to stale heartbeat/capacity state, do not
+            # suppress the local claimer and risk stranding the key.
+            report_diagnostic(supervisor_name, :restart_gate_bypass_local_missing)
+            true
+
+          true ->
+            allowed? =
+              nodes
+              |> preferred_restart_claim_nodes(meta.key, fanout)
+              |> Enum.member?(local_node)
+
+            if not allowed? do
+              report_diagnostic(supervisor_name, :restart_gate_deferred)
+            end
+
+            allowed?
+        end
+    end
+  end
+
+  defp restart_claim_contention_fanout(gate_config, now, gate_first_seen_at)
+       when is_integer(now) and is_integer(gate_first_seen_at) do
+    age_ms = max(now - gate_first_seen_at, 0)
+
+    cond do
+      age_ms < gate_config.restart_claim_gate_expand_after_ms ->
+        {:preferred, gate_config.restart_claim_preferred_fanout}
+
+      age_ms < gate_config.restart_claim_gate_disable_after_ms ->
+        {:expanded, gate_config.restart_claim_expanded_fanout}
+
+      true ->
+        :all
+    end
+  end
+
+  defp eligible_restart_claim_nodes(supervisor_name, %Meta{} = meta, _gate_config, now)
+       when is_atom(supervisor_name) and is_integer(now) do
+    heartbeat_table = heartbeat_table_name(supervisor_name)
+
+    case :ets.whereis(heartbeat_table) do
+      :undefined ->
+        []
+
+      _ ->
+        sticky_placement =
+          DurableServer.Supervisor.__augment_sticky_placement__(
+            supervisor_name,
+            meta.module,
+            meta.sticky_placement
+          )
+
+        delays = get_sticky_placement_delays(supervisor_name, meta.module)
+
+        node_health = lookup_node_health(meta)
+
+        node_unhealthy_or_full =
+          node_health in [:stale, :unknown] or
+            (match?({:healthy, _}, node_health) and
+               not can_node_accept_module?(node_health, meta.module))
+
+        needs_restart =
+          Meta.crashed?(meta) or
+            (Meta.running?(meta) and meta.permanent) or
+            (Meta.stopped_graceful?(meta) and meta.permanent)
+
+        merge_heartbeat_sources(supervisor_name, heartbeat_table, now)
+        |> Enum.flat_map(fn {node_str, node_ref, timestamp, capacity, resources, env_vars,
+                             heartbeat_meta} ->
+          try do
+            node = String.to_existing_atom(node_str)
+
+            if now - timestamp <= @node_health_staleness_threshold_ms do
+              candidate_health =
+                {:healthy,
+                 %{
+                   node_ref: node_ref,
+                   capacity: capacity,
+                   resources: resources,
+                   env_vars: env_vars,
+                   heartbeat_meta: heartbeat_meta
+                 }}
+
+              matching_level = restart_claim_matching_level(sticky_placement, env_vars)
+
+              if restart_claim_node_eligible?(
+                   meta,
+                   sticky_placement,
+                   delays,
+                   needs_restart,
+                   node_unhealthy_or_full,
+                   matching_level,
+                   candidate_health
+                 ) do
+                [node]
+              else
+                []
+              end
+            else
+              []
+            end
+          rescue
+            ArgumentError ->
+              []
+          end
+        end)
+        |> Enum.uniq()
+    end
+  end
+
+  defp restart_claim_node_eligible?(
+         %Meta{} = meta,
+         sticky_placement,
+         delays,
+         needs_restart,
+         node_unhealthy_or_full,
+         matching_level,
+         candidate_health
+       ) do
+    cond do
+      needs_restart ->
+        matching_level != nil and
+          can_claim_at_level?(meta, matching_level, delays) and
+          can_node_accept_module?(candidate_health, meta.module, matching_level: matching_level)
+
+      Meta.restart_attempt_expired?(meta) ->
+        can_node_accept_module?(candidate_health, meta.module, matching_level: matching_level) and
+          (sticky_placement in [nil, []] or matching_level != nil)
+
+      node_unhealthy_or_full ->
+        matching_level != nil and
+          can_claim_at_level?(meta, matching_level, delays) and
+          can_node_accept_module?(candidate_health, meta.module, matching_level: matching_level)
+
+      true ->
+        false
+    end
+  end
+
+  defp restart_claim_matching_level(nil, _env_vars), do: 0
+  defp restart_claim_matching_level([], _env_vars), do: 0
+
+  defp restart_claim_matching_level(sticky_placement, env_vars) when is_list(sticky_placement) do
+    Enum.find_index(sticky_placement, fn preference ->
+      case preference do
+        %{env_var: :any, value: :any} ->
+          true
+
+        %{env_var: env_var, value: expected_value} ->
+          Map.get(env_vars, env_var) == expected_value
+
+        _ ->
+          false
+      end
+    end)
+  end
+
+  defp preferred_restart_claim_nodes(nodes, key, fanout)
+       when is_list(nodes) and is_binary(key) and is_integer(fanout) and fanout > 0 do
+    count = min(fanout, length(nodes))
+
+    nodes
+    |> Enum.sort_by(&restart_claim_hash_score(key, &1), :desc)
+    |> Enum.take(count)
+  end
+
+  defp restart_claim_hash_score(key, node) do
+    node_str = to_string(node)
+    {:erlang.phash2({key, node_str}, 1_000_000_000), node_str}
+  end
+
+  defp restart_claim_gate_config(%LifecycleManager{} = state) do
+    %{
+      restart_claim_preferred_fanout: state.restart_claim_preferred_fanout,
+      restart_claim_expanded_fanout: state.restart_claim_expanded_fanout,
+      restart_claim_gate_expand_after_ms: state.restart_claim_gate_expand_after_ms,
+      restart_claim_gate_disable_after_ms: state.restart_claim_gate_disable_after_ms
+    }
+  end
+
+  defp restart_claim_gate_config(supervisor_name) when is_atom(supervisor_name) do
+    case DurableServer.Supervisor.__get_config__(supervisor_name) do
+      %{
+        restart_claim_preferred_fanout: preferred_fanout,
+        restart_claim_expanded_fanout: expanded_fanout,
+        restart_claim_gate_expand_after_ms: expand_after_ms,
+        restart_claim_gate_disable_after_ms: disable_after_ms
+      } ->
+        %{
+          restart_claim_preferred_fanout: preferred_fanout,
+          restart_claim_expanded_fanout: expanded_fanout,
+          restart_claim_gate_expand_after_ms: expand_after_ms,
+          restart_claim_gate_disable_after_ms: disable_after_ms
+        }
+
+      _ ->
+        default_restart_claim_gate_config()
+    end
+  rescue
+    RuntimeError -> default_restart_claim_gate_config()
+  end
+
+  defp default_restart_claim_gate_config do
+    %{
+      restart_claim_preferred_fanout: @restart_claim_preferred_fanout,
+      restart_claim_expanded_fanout: @restart_claim_expanded_fanout,
+      restart_claim_gate_expand_after_ms: @restart_claim_gate_expand_after_ms,
+      restart_claim_gate_disable_after_ms: @restart_claim_gate_disable_after_ms
+    }
+  end
+
+  defp discover_and_restart_servers(%LifecycleManager{} = state) do
+    diagnostics_before = discovery_diag_snapshot(state)
+    restart_gate_config = restart_claim_gate_config(state)
+    skip_count = :ets.info(state.discovery_skip_table, :size)
+
+    if skip_count > 0 do
+      log(state, :info, fn ->
+        "Discovery skip set: #{skip_count} cached non-restartable objects"
+      end)
+    end
+
+    # list all keys with this supervisor's prefix, but exclude __nodes/ heartbeat objects
+    StorageBackend.list_all_objects_stream(state.object_store, state.prefix,
+      consistent: false,
+      include_objects: true,
+      error_handler: fn reason ->
+        log(state, :error, fn -> "Failed to list objects: #{inspect(reason)}" end)
+        :continue
+      end
+    )
+    |> Stream.reject(&String.starts_with?(&1.key, "#{state.prefix}__nodes/"))
+    |> Stream.flat_map(fn %{key: storage_key, etag: etag} = entry ->
+      key = String.trim_leading(storage_key, state.prefix)
+
+      candidate =
+        case Map.fetch(entry, :body) do
+          {:ok, body} -> %{key: key, etag: etag, body: body}
+          :error -> %{key: key, etag: etag}
+        end
+
+      cond do
+        # already running — skip
+        match?({_, _}, DurableServer.Supervisor.lookup(state.supervisor_name, key)) ->
+          clear_restart_gate_state(state, key)
+          []
+
+        # in skip set with matching etag — skip permanently non-restartable,
+        # re-evaluate temporarily non-restartable (time gates, circuit breaker)
+        discovery_skip?(state, key, etag) ->
+          clear_restart_gate_state(state, key)
+          []
+
+        true ->
+          [candidate]
+      end
+    end)
+    # accumulate large batches of keys, then shuffle for randomized restart order
+    # this prevents all servers from being restarted in storage enumeration order
+    # which would cause the first node up during a cold deploy to claim everything
+    |> Stream.chunk_every(state.discovery_shuffle_batch_size)
+    |> Stream.flat_map(fn items ->
+      shuffled = Enum.shuffle(items)
+      batch_size = length(shuffled)
+
+      log(state, :info, fn ->
+        "Shuffled batch of #{batch_size} keys for distributed restart"
+      end)
+
+      Enum.map(shuffled, &{&1, batch_size})
+    end)
+    # keep restart concurrency bounded, but do not wait for an entire fixed-size
+    # batch to drain before launching more work. This avoids one slow key holding
+    # up the next N restart attempts.
+    |> Task.async_stream(
+      fn {%{key: key, etag: etag} = entry, local_candidate_batch_size} ->
+        case get_restartable_object(state, entry) do
+          {:restartable, %{} = obj, claim_context} ->
+            now = System.system_time(:millisecond)
+            gate_first_seen_at = touch_restart_gate_state(state, key, now)
+
+            if preferred_restart_claimer?(
+                 state.supervisor_name,
+                 obj.meta,
+                 restart_gate_config,
+                 Node.self(),
+                 now,
+                 gate_first_seen_at,
+                 local_candidate_batch_size,
+                 state.parallel_restart_batch_size
+               ) do
+              attempt_restart(state, obj, claim_context)
+            else
+              :noop
+            end
+
+          :skip ->
+            # permanently non-restartable — cache without meta
+            now = System.monotonic_time(:millisecond)
+            :ets.insert(state.discovery_skip_table, {key, etag, :skip, now})
+            clear_restart_gate_state(state, key)
+            :noop
+
+          {:skip, %Meta{} = meta} ->
+            # temporarily non-restartable (circuit breaker, time-gated placement,
+            # health check) — cache trimmed meta for re-evaluation next round
+            now = System.monotonic_time(:millisecond)
+            trimmed = trim_meta_for_cache(meta)
+            :ets.insert(state.discovery_skip_table, {key, etag, trimmed, now})
+            clear_restart_gate_state(state, key)
+            :noop
+
+          nil ->
+            # fetch error — don't cache
+            :noop
+        end
+      end,
+      timeout: 120_000,
+      on_timeout: :kill_task,
+      ordered: false,
+      max_concurrency: state.parallel_restart_batch_size
+    )
+    |> Enum.reduce(%{timeouts: 0, exits: 0}, fn
+      {:ok, _result}, acc ->
+        acc
+
+      {:exit, :timeout}, acc ->
+        %{acc | timeouts: acc.timeouts + 1}
+
+      {:exit, reason}, acc ->
+        log(state, :warning, fn ->
+          "Discovery task exited for item: #{inspect(reason)}"
+        end)
+
+        %{acc | exits: acc.exits + 1}
+    end)
+    |> then(fn %{timeouts: timeouts, exits: exits} ->
+      if timeouts > 0 or exits > 0 do
+        log(state, :warning, fn ->
+          "Discovery stream had #{timeouts} timeout(s) and #{exits} exit(s) (max_concurrency=#{state.parallel_restart_batch_size}, timeout_ms=120000)"
+        end)
+      end
+    end)
+
+    log_discovery_diagnostics_delta(state, diagnostics_before)
+    :ok
+  end
+
+  defp discovery_diag_snapshot(%LifecycleManager{} = state) do
+    case :ets.whereis(state.discovery_diag_table) do
+      :undefined -> %{}
+      _ -> :ets.tab2list(state.discovery_diag_table) |> Map.new()
+    end
+  rescue
+    ArgumentError -> %{}
+  end
+
+  defp log_discovery_diagnostics_delta(%LifecycleManager{} = state, before_snapshot) do
+    after_snapshot = discovery_diag_snapshot(state)
+
+    delta =
+      Enum.reduce(after_snapshot, %{}, fn {key, value}, acc ->
+        previous = Map.get(before_snapshot, key, 0)
+        diff = value - previous
+        if diff > 0, do: Map.put(acc, key, diff), else: acc
+      end)
+
+    group_nil = Map.get(delta, :group_lookup_nil, 0)
+    group_mismatch = Map.get(delta, :group_lookup_mismatch, 0)
+    slow_path = Map.get(delta, :slow_path_lock_checks, 0)
+    sync_stop_errors = Map.get(delta, :sync_and_stop_error, 0)
+    rpc_timeouts = Map.get(delta, :check_lock_rpc_timeout, 0)
+    rpc_noconnection = Map.get(delta, :check_lock_rpc_noconnection, 0)
+    rpc_notsup = Map.get(delta, :check_lock_rpc_notsup, 0)
+    placement_erpc_attempts = Map.get(delta, :remote_placement_erpc_attempt, 0)
+    placement_erpc_errors = Map.get(delta, :remote_placement_erpc_error, 0)
+    race_lookup_erpc_errors = Map.get(delta, :race_lookup_erpc_error, 0)
+    restart_gate_preferred = Map.get(delta, :restart_gate_fanout_preferred, 0)
+    restart_gate_expanded = Map.get(delta, :restart_gate_fanout_expanded, 0)
+    restart_gate_all = Map.get(delta, :restart_gate_fanout_all, 0)
+    restart_gate_deferred = Map.get(delta, :restart_gate_deferred, 0)
+    restart_gate_bypass_small = Map.get(delta, :restart_gate_bypass_small_candidate_set, 0)
+
+    restart_gate_bypass_small_local_batch =
+      Map.get(delta, :restart_gate_bypass_small_local_batch, 0)
+
+    restart_gate_bypass_missing = Map.get(delta, :restart_gate_bypass_local_missing, 0)
+    restart_claim_ok = Map.get(delta, :restart_claim_ok, 0)
+    restart_claim_already_claimed = Map.get(delta, :restart_claim_already_claimed, 0)
+    restart_claim_not_eligible = Map.get(delta, :restart_claim_not_eligible, 0)
+    restart_claim_error = Map.get(delta, :restart_claim_error, 0)
+    restart_start_ok = Map.get(delta, :restart_start_ok, 0)
+    restart_start_already_started = Map.get(delta, :restart_start_already_started, 0)
+    restart_start_timeout = Map.get(delta, :restart_start_timeout, 0)
+    restart_start_error = Map.get(delta, :restart_start_error, 0)
+
+    if group_nil > 0 or group_mismatch > 0 or sync_stop_errors > 0 or rpc_timeouts > 0 or
+         rpc_noconnection > 0 or rpc_notsup > 0 or placement_erpc_attempts > 0 or
+         placement_erpc_errors > 0 or race_lookup_erpc_errors > 0 or
+         restart_gate_preferred > 0 or restart_gate_expanded > 0 or restart_gate_all > 0 or
+         restart_gate_deferred > 0 or restart_gate_bypass_small > 0 or
+         restart_gate_bypass_small_local_batch > 0 or
+         restart_gate_bypass_missing > 0 or restart_claim_ok > 0 or
+         restart_claim_already_claimed > 0 or restart_claim_not_eligible > 0 or
+         restart_claim_error > 0 or restart_start_ok > 0 or
+         restart_start_already_started > 0 or restart_start_timeout > 0 or
+         restart_start_error > 0 do
+      log(state, :info, fn ->
+        "Discovery diagnostics delta: group_nil=#{group_nil} " <>
+          "group_mismatch=#{group_mismatch} slow_path=#{slow_path} " <>
+          "sync_stop_errors=#{sync_stop_errors} rpc_timeouts=#{rpc_timeouts} " <>
+          "rpc_noconnection=#{rpc_noconnection} rpc_notsup=#{rpc_notsup} " <>
+          "placement_erpc_attempts=#{placement_erpc_attempts} " <>
+          "placement_erpc_errors=#{placement_erpc_errors} " <>
+          "race_lookup_erpc_errors=#{race_lookup_erpc_errors} " <>
+          "restart_gate_preferred=#{restart_gate_preferred} " <>
+          "restart_gate_expanded=#{restart_gate_expanded} " <>
+          "restart_gate_all=#{restart_gate_all} " <>
+          "restart_gate_deferred=#{restart_gate_deferred} " <>
+          "restart_gate_bypass_small=#{restart_gate_bypass_small} " <>
+          "restart_gate_bypass_small_local_batch=#{restart_gate_bypass_small_local_batch} " <>
+          "restart_gate_bypass_missing=#{restart_gate_bypass_missing} " <>
+          "restart_claim_ok=#{restart_claim_ok} " <>
+          "restart_claim_already_claimed=#{restart_claim_already_claimed} " <>
+          "restart_claim_not_eligible=#{restart_claim_not_eligible} " <>
+          "restart_claim_error=#{restart_claim_error} " <>
+          "restart_start_ok=#{restart_start_ok} " <>
+          "restart_start_already_started=#{restart_start_already_started} " <>
+          "restart_start_timeout=#{restart_start_timeout} " <>
+          "restart_start_error=#{restart_start_error}"
+      end)
+    end
+  end
+
+  defp get_restartable_object(%LifecycleManager{} = state, %{key: key, etag: etag} = entry) do
+    # first check if server is eligible for restart based on metadata
+    # first see if server exists in registry, and skip it if so
+    case DurableServer.Supervisor.lookup(state.supervisor_name, key) do
+      {_pid, _meta} ->
+        nil
+
+      nil ->
+        case fetch_restartable_stored_state(state, key, etag, entry) do
+          {:ok, %StoredState{meta: %Meta{} = meta} = obj} ->
+            cond do
+              # never restart permanently crashed servers
+              Meta.permanently_crashed?(meta) ->
+                :skip
+
+              # only restart servers marked as permanent (default is false - user must opt-in)
+              not meta.permanent ->
+                :skip
+
+              # never restart explicitly stopped servers
+              Meta.stopped_permanently?(meta) ->
+                :skip
+
+              # do not attempt to start modules that no longer exist
+              not Code.ensure_loaded?(meta.module) ->
+                Logger.warning(
+                  "permanent durable server module #{inspect(meta.module)} not loaded"
+                )
+
+                :skip
+
+              true ->
+                # check module circuit breaker before proceeding
+                case CircuitBreaker.check_module_circuit_breaker(
+                       state.circuit_breaker,
+                       meta.module
+                     ) do
+                  :ok ->
+                    # proceed with existing health checks
+                    case appears_restartable?(state, meta) do
+                      {:restartable, claim_context} ->
+                        {:restartable, obj, claim_context}
+
+                      :transient ->
+                        nil
+
+                      false ->
+                        {:skip, meta}
+                    end
+
+                  {:circuit_open, cooldown_ms} ->
+                    log(state, :debug, fn ->
+                      "Module #{inspect(meta.module)} circuit breaker open for #{cooldown_ms}ms, skipping restart checks"
+                    end)
+
+                    {:skip, meta}
+                end
+            end
+
+          {:error, {kind, _, _encoded}} when kind in [:error, :throw, :exit] ->
+            # decode/parse failure — deterministic for same body, safe to cache
+            log(state, :warning, fn ->
+              "Failed to decode stored state for key #{key}: #{inspect(kind)}"
+            end)
+
+            :skip
+
+          {:error, reason} ->
+            # network/transient error — don't cache
+            log(state, :warning, fn ->
+              "Failed to get metadata for key #{key}: #{inspect(reason)}"
+            end)
+
+            nil
+        end
+    end
+  end
+
+  defp fetch_restartable_stored_state(
+         %LifecycleManager{} = state,
+         key,
+         etag,
+         %{body: %StoredState{} = stored_state}
+       )
+       when is_binary(key) and is_binary(etag) do
+    {:ok, attach_listed_stored_state_context(stored_state, key, state.prefix, etag)}
+  end
+
+  defp fetch_restartable_stored_state(
+         %LifecycleManager{} = state,
+         key,
+         _etag,
+         %{body: nil}
+       )
+       when is_binary(key) do
+    DurableServer.fetch_stored_state(
+      state.object_store,
+      %{
+        key: key,
+        prefix: state.prefix
+      },
+      consistent: false
+    )
+  end
+
+  defp fetch_restartable_stored_state(
+         %LifecycleManager{} = _state,
+         key,
+         _etag,
+         %{body: other}
+       )
+       when is_binary(key) do
+    {:error, {:unexpected_value_type, other}}
+  end
+
+  defp fetch_restartable_stored_state(%LifecycleManager{} = state, key, _etag, _entry)
+       when is_binary(key) do
+    DurableServer.fetch_stored_state(
+      state.object_store,
+      %{
+        key: key,
+        prefix: state.prefix
+      },
+      consistent: false
+    )
+  end
+
+  defp attach_listed_stored_state_context(
+         %StoredState{meta: %Meta{} = meta} = stored_state,
+         key,
+         prefix,
+         etag
+       )
+       when is_binary(key) and is_binary(prefix) and is_binary(etag) do
+    %StoredState{
+      stored_state
+      | key: key,
+        prefix: prefix,
+        etag: etag,
+        meta: %{meta | key: key, prefix: prefix}
+    }
+  end
+
+  defp appears_restartable?(%LifecycleManager{} = state, %Meta{} = meta) do
+    case check_server_health(state, meta) do
+      :healthy ->
+        false
+
+      {:orphaned, claim_context} ->
+        # server is orphaned, check if this node should handle it
+        if orphan_claimable?(meta), do: {:restartable, claim_context}, else: false
+
+      :orphaned ->
+        if orphan_claimable?(meta), do: {:restartable, :check_lock}, else: false
+
+      :transient ->
+        :transient
+    end
+  end
+
+  defp orphan_claimable?(%Meta{} = meta) do
+    # any orphaned server can be claimed by any node - this handles edge cases
+    # where the assigned node is down/unreachable. Sticky placement preferences
+    node_health = lookup_node_health(meta)
+
+    # Node is unhealthy OR at capacity for this module
+    node_unhealthy_or_full =
+      node_health in [:stale, :unknown] or
+        (match?({:healthy, _}, node_health) and
+           not can_node_accept_module?(node_health, meta.module))
+
+    # Get my env vars for sticky placement matching from supervisor config
+    my_env_vars = get_my_env_vars(meta.supervisor)
+
+    # Augment already-fetched sticky_placement with module config (e.g. :any added after process started).
+    # We use meta.sticky_placement directly instead of doing another S3 GET — a failed GET would
+    # return nil, causing find_my_matching_level(nil, _) to return 0, bypassing sticky placement entirely.
+    augmented_sticky_placement =
+      DurableServer.Supervisor.__augment_sticky_placement__(
+        meta.supervisor,
+        meta.module,
+        meta.sticky_placement
+      )
+
+    # Find which sticky placement level I match (if any)
+    my_matching_level = find_my_matching_level(augmented_sticky_placement, my_env_vars)
+
+    # Get delays for this module
+    delays = get_sticky_placement_delays(meta.supervisor, meta.module)
+
+    # Server needs restart if:
+    # - It crashed (status: :crashed)
+    # - It was gracefully stopped while permanent (e.g., by Terminator during deploy)
+    # - It has :running status but we're in orphan_claimable? (meaning the process died
+    #   without updating storage - an abnormal crash that bypassed termination callbacks)
+    # Non-permanent servers stay stopped.
+    needs_restart =
+      Meta.crashed?(meta) or
+        (Meta.running?(meta) and meta.permanent) or
+        (Meta.stopped_graceful?(meta) and meta.permanent)
+
+    cond do
+      # Crashed or gracefully stopped permanent servers: claim if we match a sticky level (respecting timing)
+      needs_restart && my_matching_level != nil ->
+        # We match some level, check if enough time has passed for our level
+        can_claim_at_level?(meta, my_matching_level, delays)
+
+      needs_restart && my_matching_level == nil ->
+        # We don't match any sticky level. Since my_matching_level is nil, this means:
+        # 1. There IS a sticky config (otherwise find_my_matching_level returns 0)
+        # 2. :any is NOT in the config (otherwise we'd match :any)
+        # 3. We don't match any specific env var
+        # Therefore, this node can NEVER claim this orphan.
+        false
+
+      Meta.restart_attempt_expired?(meta) ->
+        true
+
+      node_unhealthy_or_full ->
+        # Node is unhealthy/full, check sticky placement
+        case my_matching_level do
+          nil ->
+            # We don't match any sticky level. Since my_matching_level is nil, this means:
+            # 1. There IS a sticky config (otherwise find_my_matching_level returns 0)
+            # 2. :any is NOT in the config (otherwise we'd match :any)
+            # 3. We don't match any specific env var
+            # Therefore, this node can NEVER claim this orphan.
+            false
+
+          level ->
+            # We match a sticky level, check timing
+            can_claim_reason = capacity_rejection_reason(node_health, meta.module)
+
+            if can_claim_at_level?(meta, level, delays) do
+              Logger.info("""
+              Claiming orphan #{meta.key} from #{meta.node_str} (sticky level #{level})
+              Reason: #{can_claim_reason}
+              """)
+
+              true
+            else
+              false
+            end
+        end
+
+      true ->
+        false
+    end
+  end
+
+  # Find which level of sticky_placement I match (0-indexed), or nil if no match
+  defp find_my_matching_level(nil, _my_env_vars), do: 0
+  defp find_my_matching_level([], _my_env_vars), do: 0
+
+  defp find_my_matching_level(sticky_placement, my_env_vars) when is_list(sticky_placement) do
+    Enum.find_index(sticky_placement, fn preference ->
+      case preference do
+        %{env_var: :any, value: :any} ->
+          true
+
+        %{env_var: env_var, value: expected_value} ->
+          Map.get(my_env_vars, env_var) == expected_value
+
+        _ ->
+          false
+      end
+    end)
+  end
+
+  # Check if enough time has passed for my level to claim
+  defp can_claim_at_level?(meta, my_level, delays) do
+    # Calculate cumulative delay for my level
+    my_unlock_time = Enum.take(delays, my_level) |> Enum.sum()
+
+    # Check if we've passed the unlock time
+    !Meta.last_heartbeat_within_ms(meta, my_unlock_time)
+  end
+
+  # Get sticky placement delays for a module
+  defp get_sticky_placement_delays(supervisor, module) do
+    case DurableServer.Supervisor.__get_sticky_placement_for_module__(supervisor, module) do
+      nil ->
+        []
+
+      list ->
+        Enum.map(list, fn {_env_var_atom, delay} -> delay end)
+    end
+  end
+
+  # Get my current env vars as a map, using the configured sticky placement env vars
+  defp get_my_env_vars(supervisor_name) do
+    env_var_names = DurableServer.Supervisor.collect_sticky_placement_env_vars(supervisor_name)
+
+    env_var_names
+    |> Enum.map(fn var_name -> {var_name, System.get_env(var_name)} end)
+    |> Enum.into(%{})
+  end
+
+  defp discovery_skip?(%LifecycleManager{} = state, key, etag) do
+    case :ets.lookup(state.discovery_skip_table, key) do
+      [{^key, ^etag, :skip, _ts}] ->
+        true
+
+      [{^key, ^etag, %Meta{} = meta, _ts}] ->
+        # Etag unchanged so stored state is identical, but time-dependent checks
+        # (placement gates, circuit breaker, node health) may have changed.
+        case CircuitBreaker.check_module_circuit_breaker(state.circuit_breaker, meta.module) do
+          {:circuit_open, _} ->
+            true
+
+          :ok ->
+            case appears_restartable?(state, meta) do
+              {:restartable, _claim_context} ->
+                # Now restartable — remove from cache, let async task do fresh GET
+                :ets.delete(state.discovery_skip_table, key)
+                false
+
+              :transient ->
+                # Heartbeat/read uncertainty is not a stable "non-restartable" state.
+                # Drop the cache entry so the next async pass does a fresh read.
+                :ets.delete(state.discovery_skip_table, key)
+                false
+
+              false ->
+                true
+            end
+        end
+
+      _ ->
+        false
+    end
+  end
+
+  # Strip fields not needed for re-evaluation to reduce ETS memory.
+  # Drops sticky_placement_history (~2KB), crash_history, init_from_*, etc.
+  defp trim_meta_for_cache(%Meta{} = meta) do
+    %Meta{
+      meta
+      | sticky_placement_history: [],
+        crash_history: [],
+        init_from_ref: nil,
+        init_from_pid: nil,
+        restart_attempt_node: nil,
+        prefix: nil
+    }
+  end
+
+  defp try_restart_child(%LifecycleManager{} = state, {module, init_arg}, preloaded) do
+    if Code.ensure_loaded?(module) do
+      # note: we must pass max_placement_retries: 0 to prevent remote placement
+      # because lifecycle manager is only concered with its own local node
+      DurableServer.Supervisor.__start_child__(
+        state.supervisor_name,
+        {module, init_arg,
+         %{
+           preloaded: preloaded,
+           is_sticky_local: false,
+           restart_attempt_node: to_string(Node.self())
+         }},
+        max_placement_retries: 0,
+        timeout: state.restart_start_timeout_ms
+      )
+    else
+      {:error, {:undef, module}}
+    end
+  end
+
+  defp attempt_restart(
+         %LifecycleManager{} = state,
+         %StoredState{meta: %Meta{} = meta} = stored_state,
+         claim_context
+       ) do
+    claim_opts = [ttl: restart_claim_ttl_ms(state)]
+
+    claim_result =
+      case claim_context do
+        :verified_expired_lock ->
+          DurableServer.claim_restart_attempt_with_verified_expired_lock(
+            state.object_store,
+            stored_state,
+            claim_opts
+          )
+
+        :check_lock ->
+          DurableServer.claim_restart_attempt(state.object_store, stored_state, claim_opts)
+      end
+
+    report_diagnostic(state.supervisor_name, restart_claim_diag_key(claim_result))
+
+    case claim_result do
+      {:ok, %{body: body, etag: etag}} ->
+        module = meta.module
+
+        start_result =
+          try_restart_child(
+            state,
+            {module, [key: meta.key, initial_state: %{}]},
+            %{body: body, etag: etag}
+          )
+
+        report_diagnostic(state.supervisor_name, restart_start_diag_key(start_result))
+
+        case start_result do
+          {:ok, {_pid, _meta}} ->
+            clear_restart_gate_state(state, meta.key)
+
+            log(state, :info, fn ->
+              "Successfully restarted DurableServer #{meta.key} on #{Node.self()}"
+            end)
+
+          {:error, reason} ->
+            log_level =
+              case reason do
+                {:already_started, _} -> :info
+                _ -> :error
+              end
+
+            log(state, log_level, fn ->
+              "Failed to restart DurableServer #{meta.key}: #{inspect(reason)}"
+            end)
+
+            if match?({:already_started, _}, reason) do
+              clear_restart_gate_state(state, meta.key)
+            end
+
+            if counts_towards_module_restart_circuit_breaker?(reason) do
+              CircuitBreaker.increment_module_circuit_breaker(state.circuit_breaker, module)
+            end
+
+            maybe_clear_restart_attempt_after_failure(state, stored_state, body, etag, reason)
+        end
+
+      {:error, :already_claimed} ->
+        # another node is handling this restart
+        :ok
+
+      {:error, :not_eligible} ->
+        # server is not eligible for restart (still locked or permanently stopped)
+        :ok
+
+      {:error, reason} ->
+        log(state, :warning, fn ->
+          "Failed to claim restart for #{meta.key}: #{inspect(reason)}"
+        end)
+
+        :ok
+    end
+  end
+
+  defp restart_claim_diag_key({:ok, _}), do: :restart_claim_ok
+  defp restart_claim_diag_key({:error, :already_claimed}), do: :restart_claim_already_claimed
+  defp restart_claim_diag_key({:error, :not_eligible}), do: :restart_claim_not_eligible
+  defp restart_claim_diag_key({:error, _reason}), do: :restart_claim_error
+
+  defp restart_start_diag_key({:ok, _}), do: :restart_start_ok
+  defp restart_start_diag_key({:error, {:already_started, _}}), do: :restart_start_already_started
+  defp restart_start_diag_key({:error, :timeout}), do: :restart_start_timeout
+  defp restart_start_diag_key({:error, _reason}), do: :restart_start_error
+
+  defp counts_towards_module_restart_circuit_breaker?({:already_started, _}), do: false
+  defp counts_towards_module_restart_circuit_breaker?({:capacity_limit, _}), do: false
+  defp counts_towards_module_restart_circuit_breaker?(:not_ready), do: false
+  defp counts_towards_module_restart_circuit_breaker?(:timeout), do: false
+  defp counts_towards_module_restart_circuit_breaker?(_reason), do: true
+
+  defp maybe_clear_restart_attempt_after_failure(
+         %LifecycleManager{} = state,
+         %StoredState{} = stored_state,
+         body,
+         etag,
+         reason
+       ) do
+    if clear_restart_attempt_after_failure?(reason) do
+      DurableServer.clear_restart_attempt(state.object_store, %{
+        key: stored_state.key,
+        prefix: stored_state.prefix,
+        body: body,
+        etag: etag
+      })
+    else
+      :ok
+    end
+  end
+
+  defp clear_restart_attempt_after_failure?(:timeout), do: false
+  defp clear_restart_attempt_after_failure?({:already_started, _}), do: false
+  defp clear_restart_attempt_after_failure?(_reason), do: true
+
+  defp restart_claim_ttl_ms(%LifecycleManager{} = state) do
+    restart_claim_ttl_ms(state.restart_start_timeout_ms)
+  end
+
+  defp restart_claim_ttl_ms(restart_start_timeout_ms)
+       when is_integer(restart_start_timeout_ms) and restart_start_timeout_ms > 0 do
+    max(@restart_claim_ttl_min_ms, restart_start_timeout_ms + @restart_claim_ttl_buffer_ms)
+  end
+
+  defp touch_restart_gate_state(%LifecycleManager{} = state, key, now)
+       when is_binary(key) and is_integer(now) do
+    case :ets.lookup(state.restart_gate_table, key) do
+      [{^key, first_seen_at, _last_seen_at}] ->
+        :ets.insert(state.restart_gate_table, {key, first_seen_at, now})
+        first_seen_at
+
+      [] ->
+        true = :ets.insert_new(state.restart_gate_table, {key, now, now})
+        now
+    end
+  rescue
+    ArgumentError ->
+      now
+  end
+
+  defp clear_restart_gate_state(%LifecycleManager{} = state, key) when is_binary(key) do
+    :ets.delete(state.restart_gate_table, key)
+    :ok
+  rescue
+    ArgumentError ->
+      :ok
+  end
+
+  defp check_server_health(%LifecycleManager{} = state, %Meta{} = meta) do
+    %{supervisor_name: supervisor_name} = state
+
+    cond do
+      # if it's stopped, no need to look up
+      Meta.stopped_permanently?(meta) ->
+        :healthy
+
+      true ->
+        # before taking slow path of checking locks via rpc, first see if server is alive in syn
+        case Group.lookup(supervisor_name, meta.key, extract_meta: & &1) do
+          {pid, registry_meta} when is_pid(pid) ->
+            case registry_meta do
+              %{node_ref: node_ref} ->
+                if to_string(node(pid)) == meta.node_str and node_ref == meta.node_ref do
+                  report_diagnostic(supervisor_name, :group_lookup_match)
+                  :healthy
+                else
+                  report_diagnostic(supervisor_name, :group_lookup_mismatch)
+                  fetch_orphaned_slow_path(meta)
+                end
+
+              %{} ->
+                report_diagnostic(supervisor_name, :group_lookup_mismatch)
+                fetch_orphaned_slow_path(meta)
+            end
+
+          nil ->
+            report_diagnostic(supervisor_name, :group_lookup_nil)
+            fetch_orphaned_slow_path(meta)
+        end
+    end
+  end
+
+  defp fetch_orphaned_slow_path(%Meta{} = meta) do
+    report_diagnostic(meta.supervisor, :slow_path_lock_checks)
+    node_health = lookup_node_health(meta)
+    lock_result = DurableServer.check_lock_status(meta)
+
+    cond do
+      # node is healthy but can't accept this module (at capacity)
+      match?({:healthy, _}, node_health) and
+          not can_node_accept_module?(node_health, meta.module) ->
+        :orphaned
+
+      # check if the process lock has expired
+      lock_result == :expired ->
+        {:orphaned, :verified_expired_lock}
+
+      # server explicitly marked as crashed
+      Meta.crashed?(meta) ->
+        :orphaned
+
+      # previous restart attempt has expired
+      Meta.restart_attempt_expired?(meta) ->
+        :orphaned
+
+      transient_lock_check_error?(lock_result) ->
+        :transient
+
+      true ->
+        :healthy
+    end
+  end
+
+  defp transient_lock_check_error?({:error, reason}), do: conflict_consistent_read_error?(reason)
+  defp transient_lock_check_error?(_), do: false
+
+  defp conflict_consistent_read_error?(:conflict), do: true
+  defp conflict_consistent_read_error?(":conflict"), do: true
+
+  defp conflict_consistent_read_error?({:consistent_read_failed, reason}),
+    do: conflict_consistent_read_error?(reason)
+
+  defp conflict_consistent_read_error?(_), do: false
+
+  @doc """
+  Checks if the supervisor can accept a new child of the given module.
+
+  Returns `:ok` if capacity is available, or
+  `{:error, {:limit_reached, reason, details}}`
+  if any limit is exceeded.
+
+  This function is pure ETS/Group reads with no blocking operations.
+
+  ## Options
+
+    * `:bypass_disk_check` - when `true`, skips the `max_disk` limit check.
+      Used for sticky restarts where the child's data already resides on
+      the local disk, so rejecting based on disk usage would be counterproductive.
+  """
+  def check_capacity(supervisor_name, module, opts \\ []) do
+    opts = Keyword.validate!(opts, [:bypass_disk_check])
+
+    with :ok <- check_shutting_down(supervisor_name),
+         :ok <- check_count_limits(supervisor_name, module),
+         :ok <- check_resource_limits(supervisor_name, opts) do
+      :ok
+    end
+  end
+
+  defp check_shutting_down(supervisor_name) do
+    %{ets_table: table_name} =
+      DurableServer.Supervisor.__get_config__(supervisor_name)
+
+    case :ets.lookup(table_name, :shutting_down) do
+      [{:shutting_down, true}] -> {:error, {:limit_reached, :node_shutting_down, %{}}}
+      _ -> :ok
+    end
+  end
+
+  defp check_count_limits(supervisor_name, module) do
+    %{ets_table: table_name} =
+      DurableServer.Supervisor.__get_config__(supervisor_name)
+
+    [{:capacity_limits, limits}] = :ets.lookup(table_name, :capacity_limits)
+
+    case limits[:max_children] do
+      nil ->
+        :ok
+
+      max_children_limits ->
+        global_count = Group.local_registry_count(supervisor_name)
+
+        module_count =
+          Group.local_member_count(
+            supervisor_name,
+            DurableServer.Supervisor.__module_group_prefix__(module)
+          )
+
+        total_limit = max_children_limits[:total]
+        module_limit = max_children_limits[module]
+
+        cond do
+          total_limit && global_count >= total_limit ->
+            {:error,
+             {:limit_reached, :max_children_total, %{current: global_count, limit: total_limit}}}
+
+          module_limit && module_count >= module_limit ->
+            {:error,
+             {:limit_reached, :max_children_module,
+              %{module: module, current: module_count, limit: module_limit}}}
+
+          true ->
+            :ok
+        end
+    end
+  end
+
+  defp check_resource_limits(supervisor_name, opts) do
+    opts = Keyword.validate!(opts, [:bypass_disk_check])
+    bypass_disk_check = Keyword.get(opts, :bypass_disk_check, false)
+
+    %{ets_table: table_name} = DurableServer.Supervisor.__get_config__(supervisor_name)
+    [{:capacity_limits, limits}] = :ets.lookup(table_name, :capacity_limits)
+
+    max_cpu = limits[:max_cpu]
+    max_memory = limits[:max_memory]
+    max_disk = limits[:max_disk]
+
+    if is_nil(max_cpu) and is_nil(max_memory) and is_nil(max_disk) do
+      :ok
+    else
+      {cpu, memory, disk} =
+        case :ets.lookup(table_name, :resource_metrics) do
+          [{:resource_metrics, {cpu, memory, disk, _ts}}]
+          when is_number(cpu) and is_number(memory) ->
+            {cpu, memory, disk}
+
+          _ ->
+            {0.0, 0.0, nil}
+        end
+
+      cond do
+        max_cpu && cpu >= max_cpu ->
+          {:error, {:limit_reached, :max_cpu, %{current: cpu, limit: max_cpu}}}
+
+        max_memory && memory >= max_memory ->
+          {:error, {:limit_reached, :max_memory, %{current: memory, limit: max_memory}}}
+
+        not bypass_disk_check && max_disk && disk && disk >= max_disk.percent ->
+          {:error,
+           {:limit_reached, :max_disk,
+            %{current: disk, limit: max_disk.percent, mount_point: max_disk.mount_point}}}
+
+        true ->
+          :ok
+      end
+    end
+  end
+
+  defp update_resource_metrics(%LifecycleManager{supervisor_name: supervisor_name} = state) do
+    cpu = calculate_cpu_percent()
+    memory = calculate_memory_percent()
+    timestamp = System.monotonic_time(:second)
+
+    %{ets_table: table_name} = DurableServer.Supervisor.__get_config__(supervisor_name)
+    [{:capacity_limits, limits}] = :ets.lookup(table_name, :capacity_limits)
+
+    # Calculate disk if max_disk is configured
+    disk =
+      case limits[:max_disk] do
+        %{mount_point: mount_point} -> calculate_disk_percent(mount_point)
+        nil -> nil
+      end
+
+    :ets.insert(table_name, {:resource_metrics, {cpu, memory, disk, timestamp}})
+
+    # log warnings if at 90% of limit
+    check_warning_thresholds(supervisor_name, cpu, memory, disk, limits)
+
+    state
+  end
+
+  defp check_warning_thresholds(supervisor_name, cpu, memory, disk, limits) do
+    max_cpu = limits[:max_cpu]
+    max_memory = limits[:max_memory]
+    max_disk = limits[:max_disk]
+
+    if max_cpu && cpu >= max_cpu * 0.9 do
+      Logger.warning(
+        "CPU usage high on #{Node.self()} for supervisor #{supervisor_name}: #{cpu}% (limit: #{max_cpu}%)"
+      )
+    end
+
+    if max_memory && memory >= max_memory * 0.9 do
+      Logger.warning(
+        "Memory usage high on #{Node.self()} for supervisor #{supervisor_name}: #{memory}% (limit: #{max_memory}%)"
+      )
+    end
+
+    if max_disk && disk && disk >= max_disk.percent * 0.9 do
+      Logger.warning(
+        "Disk usage high on #{Node.self()} for supervisor #{supervisor_name}: #{disk}% on #{max_disk.mount_point} (limit: #{max_disk.percent}%)"
+      )
+    end
+  end
+
+  defp calculate_cpu_percent do
+    avg1 = :cpu_sup.avg1()
+    num_cores = :erlang.system_info(:logical_processors_available)
+    Float.round(avg1 / (num_cores * 256) * 100, 1)
+  rescue
+    error ->
+      Logger.warning("Failed to get CPU usage: #{inspect(error)}")
+      0.0
+  end
+
+  defp calculate_memory_percent do
+    data = :memsup.get_system_memory_data()
+    total = Keyword.fetch!(data, :total_memory)
+
+    available =
+      Keyword.get(data, :available_memory) ||
+        Keyword.fetch!(data, :free_memory) + Keyword.get(data, :cached_memory, 0)
+
+    used = total - available
+    Float.round(used / total * 100, 1)
+  rescue
+    error ->
+      Logger.warning("Failed to get memory usage: #{inspect(error)}")
+      0.0
+  end
+
+  defp calculate_disk_percent(mount_point) do
+    disk_data = :disksup.get_disk_data()
+
+    # Find the matching mount point
+    case Enum.find(disk_data, fn {mount, _size, _percent} ->
+           to_string(mount) == mount_point
+         end) do
+      {_mount, _size, percent} ->
+        # :disksup returns percent as integer already
+        percent * 1.0
+
+      nil ->
+        # Mount point not found - treat as unconfigured (nil) rather than 0%
+        Logger.warning(
+          "Mount point #{mount_point} not found in disk data, max_disk limit disabled"
+        )
+
+        nil
+    end
+  rescue
+    error ->
+      Logger.warning("Failed to get disk usage: #{inspect(error)}, max_disk limit disabled")
+      nil
+  end
+
+  defp calculate_resource_map(supervisor_name) do
+    %{ets_table: table_name} = DurableServer.Supervisor.__get_config__(supervisor_name)
+
+    {cpu, memory, disk} =
+      case :ets.lookup(table_name, :resource_metrics) do
+        [{:resource_metrics, {cpu, memory, disk, _ts}}] -> {cpu, memory, disk}
+        [] -> {nil, nil, nil}
+      end
+
+    [{:capacity_limits, limits}] = :ets.lookup(table_name, :capacity_limits)
+    max_cpu = limits[:max_cpu]
+    max_memory = limits[:max_memory]
+    max_disk = limits[:max_disk]
+
+    # only include if at least one value is present
+    # note: disk is only set if max_disk is configured AND mount point exists
+    if cpu || memory || disk || max_cpu || max_memory do
+      %{}
+      |> maybe_put(:cpu, cpu)
+      |> maybe_put(:max_cpu, max_cpu)
+      |> maybe_put(:memory, memory)
+      |> maybe_put(:max_memory, max_memory)
+      |> maybe_put(:disk, disk)
+      |> maybe_put(:max_disk, disk && max_disk && max_disk.percent)
+    else
+      nil
+    end
+  end
+
+  defp maybe_put(map, _key, nil), do: map
+  defp maybe_put(map, key, value), do: Map.put(map, key, value)
+
+  defp normalize_heartbeat_term(nil), do: nil
+
+  defp normalize_heartbeat_term(term) when is_binary(term) or is_boolean(term) or is_number(term),
+    do: term
+
+  defp normalize_heartbeat_term(term) when is_atom(term), do: Atom.to_string(term)
+
+  defp normalize_heartbeat_term(list) when is_list(list) do
+    Enum.map(list, &normalize_heartbeat_term/1)
+  end
+
+  defp normalize_heartbeat_term(%{} = map) do
+    Enum.into(map, %{}, fn
+      {key, value} when is_atom(key) ->
+        {Atom.to_string(key), normalize_heartbeat_term(value)}
+
+      {key, value} when is_binary(key) ->
+        {key, normalize_heartbeat_term(value)}
+    end)
+  end
+
+  defp normalize_heartbeat_term(other) do
+    raise ArgumentError,
+          "heartbeat data must be JSON-compatible, got: #{inspect(other)}"
+  end
+
+  defp parse_capacity(nil), do: nil
+
+  defp parse_capacity(capacity) when is_map(capacity) do
+    Enum.into(capacity, %{}, fn
+      {"total", value} -> {:total, parse_capacity_value(value)}
+      {module_str, value} -> {String.to_existing_atom(module_str), parse_capacity_value(value)}
+    end)
+  rescue
+    ArgumentError ->
+      # module doesn't exist as an atom, return nil
+      nil
+  end
+
+  defp parse_capacity_value(%{"current" => c, "limit" => l})
+       when is_integer(c) and is_integer(l) do
+    %{current: c, limit: l}
+  end
+
+  defp parse_capacity_value(_), do: nil
+
+  defp parse_resources(nil), do: nil
+
+  defp parse_resources(resources) when is_map(resources) do
+    %{}
+    |> maybe_put(:cpu, resources["cpu"])
+    |> maybe_put(:max_cpu, resources["max_cpu"])
+    |> maybe_put(:memory, resources["memory"])
+    |> maybe_put(:max_memory, resources["max_memory"])
+    |> then(fn map -> if map_size(map) > 0, do: map, else: nil end)
+  end
+
+  defp parse_heartbeat_meta(nil), do: nil
+
+  defp parse_heartbeat_meta(%{} = heartbeat_meta),
+    do: normalize_heartbeat_meta_keys(heartbeat_meta)
+
+  # Parses persisted heartbeat data into a structured tuple for ETS storage
+  # Returns {:ok, {node_str, node_ref, timestamp, capacity, resources, env_vars, heartbeat_meta}}
+  # or {:error, :invalid_format}
+  defp parse_heartbeat_data(
+         %{
+           "node" => node_str,
+           "node_ref" => node_ref,
+           "last_heartbeat_at" => timestamp
+         } = data
+       ) do
+    capacity = parse_capacity(data["capacity"])
+    resources = parse_resources(data["resources"])
+    env_vars = data["env_vars"] || %{}
+    heartbeat_meta = parse_heartbeat_meta(data["heartbeat_meta"])
+
+    {:ok, {node_str, node_ref, timestamp, capacity, resources, env_vars, heartbeat_meta}}
+  end
+
+  defp parse_heartbeat_data(_), do: {:error, :invalid_format}
+
+  @doc """
+  Finds nodes that can accept the given module, sorted by sticky placement preference and busyness.
+
+  Returns a list of node atoms that have capacity for the module, sorted by:
+  1. Sticky placement preference (most specific match first)
+  2. Least busy nodes first
+
+  Node busyness is calculated as the highest utilization ratio across all limits
+  (global capacity, module capacity, CPU, memory). Nodes with lower utilization
+  are prioritized for better load distribution.
+
+  Always excludes the local node since we only lookup eligible remote nodes
+  after local placement fails.
+
+  ## Options
+
+  - `:limit` - Maximum number of nodes to return (default: 3)
+  - `:key` - The server key, used to load augmented sticky placement preferences
+
+  ## Examples
+
+      iex> find_eligible_nodes(MySupervisor, MyServer)
+      [:node1@host, :node2@host]  # Sorted by sticky preference, then by least busy
+
+      iex> find_eligible_nodes(MySupervisor, MyServer, limit: 5)
+      [:node1@host, :node2@host, :node3@host]
+
+  """
+  def find_eligible_nodes(supervisor_name, module, opts \\ []) when is_atom(supervisor_name) do
+    heartbeat_table = heartbeat_table_name(supervisor_name)
+    # Handle case where table doesn't exist yet during startup
+    case :ets.whereis(heartbeat_table) do
+      :undefined ->
+        []
+
+      _tid ->
+        limit = Keyword.get(opts, :limit, 3)
+        key = Keyword.get(opts, :key)
+        my_node = Node.self()
+
+        # Get sticky placement - prefer passed in opts (already augmented), otherwise load and augment
+        sticky_placement =
+          cond do
+            Keyword.has_key?(opts, :sticky_placement) ->
+              Keyword.get(opts, :sticky_placement)
+
+            key != nil ->
+              # Load and augment persisted sticky placement for existing servers
+              DurableServer.Supervisor.__get_augmented_sticky_placement__(
+                supervisor_name,
+                module,
+                key
+              )
+
+            true ->
+              # No key means this is for a new server - sticky placement doesn't apply yet
+              # since we don't know what env vars it will have until it starts
+              nil
+          end
+
+        now = System.system_time(:millisecond)
+
+        # Merge two data sources per node, picking whichever has the more recent timestamp:
+        # 1. S3 heartbeat ETS cache — source of truth for "can this node reach S3?"
+        # 2. Group PG members — fast path, gives instant discovery via peer_connect
+        # Liveness is ALWAYS computed from timestamp, never from mere Group presence.
+        merged_nodes = merge_heartbeat_sources(supervisor_name, heartbeat_table, now)
+
+        merged_nodes
+        |> Enum.map(fn {node_str, node_ref, timestamp, capacity, resources, env_vars,
+                        heartbeat_meta} ->
+          try do
+            node = String.to_existing_atom(node_str)
+
+            heartbeat_age_ms = now - timestamp
+
+            health =
+              if heartbeat_age_ms <= @node_health_staleness_threshold_ms do
+                {:healthy,
+                 %{
+                   node_ref: node_ref,
+                   capacity: capacity,
+                   resources: resources,
+                   env_vars: env_vars,
+                   heartbeat_meta: heartbeat_meta
+                 }}
+              else
+                :stale
+              end
+
+            matching_level = find_matching_level(sticky_placement, env_vars)
+
+            {node, health, matching_level, timestamp}
+          rescue
+            ArgumentError ->
+              nil
+          end
+        end)
+        |> Enum.reject(&is_nil/1)
+        |> Enum.filter(fn {node, health, matching_level, _timestamp} ->
+          node != my_node and
+            can_node_accept_module?(health, module, matching_level: matching_level) and
+            (sticky_placement in [nil, []] or matching_level != nil)
+        end)
+        |> Enum.sort_by(fn {_node, health, matching_level, timestamp} ->
+          level_priority = if matching_level == nil, do: 999, else: matching_level
+          busyness = calculate_node_busyness(health, module)
+          staleness = -timestamp
+          {level_priority, busyness, staleness}
+        end)
+        |> Enum.take(limit)
+        |> Enum.map(fn {node, _health, _matching_level, _timestamp} -> node end)
+    end
+  end
+
+  # Merge heartbeat data from S3 ETS cache and Group PG members.
+  # For each node present in both sources, pick the entry with the more recent timestamp.
+  # Returns a list of heartbeat tuples in the same shape as the ETS entries.
+  defp merge_heartbeat_sources(supervisor_name, heartbeat_table, _now) do
+    # Start with ETS cache as the base (keyed by node_str)
+    ets_entries = :ets.tab2list(heartbeat_table)
+
+    ets_map =
+      Map.new(ets_entries, fn {node_str, _node_ref, _ts, _cap, _res, _env, _meta} = entry ->
+        {node_str, entry}
+      end)
+
+    # Overlay Group PG members — each member is {pid, meta} where meta contains heartbeat data
+    group_entries =
+      try do
+        Group.members(supervisor_name, @heartbeat_group_key)
+      rescue
+        # Group not started yet, or supervisor name not registered
+        _ -> []
+      end
+
+    merged =
+      Enum.reduce(group_entries, ets_map, fn {_pid, meta}, acc ->
+        node_str = meta.node
+        group_ts = meta.timestamp
+
+        group_entry =
+          {node_str, meta.node_ref, group_ts, meta.capacity, meta.resources, meta.env_vars,
+           meta.heartbeat_meta}
+
+        case Map.get(acc, node_str) do
+          nil ->
+            # Node only in Group (new node, not yet in S3 cache) — use Group data
+            Map.put(acc, node_str, group_entry)
+
+          {_ns, _nr, ets_ts, _c, _r, _e, _m} when group_ts > ets_ts ->
+            # Group data is more recent — use it
+            Map.put(acc, node_str, group_entry)
+
+          _ets_entry ->
+            # ETS data is same age or more recent — keep it
+            acc
+        end
+      end)
+
+    Map.values(merged)
+  end
+
+  # Find which sticky placement level matches the given env_vars from a node's heartbeat
+  # Returns the matching level index (0 = exact match, 1 = less specific, etc.) or nil if no match
+  defp find_matching_level(nil, _env_vars), do: nil
+  defp find_matching_level([], _env_vars), do: nil
+
+  defp find_matching_level(sticky_placement, env_vars) when is_list(sticky_placement) do
+    Enum.find_index(sticky_placement, fn preference ->
+      case preference do
+        %{env_var: :any, value: :any} ->
+          true
+
+        %{env_var: env_var, value: expected_value} ->
+          Map.get(env_vars, env_var) == expected_value
+
+        _ ->
+          false
+      end
+    end)
+  end
+
+  # calculate how "busy" a node is (0.0 = empty, 1.0 = full)
+  # returns the highest utilization across all limits
+  defp calculate_node_busyness({:healthy, info}, module) do
+    ratios = []
+
+    # check total capacity ratio
+    ratios =
+      case info[:capacity][:total] do
+        %{current: current, limit: limit} when limit > 0 ->
+          [current / limit | ratios]
+
+        _ ->
+          ratios
+      end
+
+    # check module-specific capacity ratio
+    ratios =
+      case info[:capacity][module] do
+        %{current: current, limit: limit} when limit > 0 ->
+          [current / limit | ratios]
+
+        _ ->
+          ratios
+      end
+
+    # check CPU ratio
+    ratios =
+      case {info[:resources][:cpu], info[:resources][:max_cpu]} do
+        {cpu, max_cpu} when is_number(cpu) and is_number(max_cpu) and max_cpu > 0 ->
+          [cpu / max_cpu | ratios]
+
+        _ ->
+          ratios
+      end
+
+    # check memory ratio
+    ratios =
+      case {info[:resources][:memory], info[:resources][:max_memory]} do
+        {memory, max_memory}
+        when is_number(memory) and is_number(max_memory) and max_memory > 0 ->
+          [memory / max_memory | ratios]
+
+        _ ->
+          ratios
+      end
+
+    # return the maximum ratio (highest utilization)
+    # if no ratios available, return 0.0 (least busy)
+    case ratios do
+      [] -> 0.0
+      _ -> Enum.max(ratios)
+    end
+  end
+
+  defp calculate_node_busyness(_, _), do: 1.0
+
+  @doc """
+  Checks if a node can accept a server for the given module based on capacity info.
+
+  Returns true if:
+  - Node has capacity for the module (count limits)
+  - Node has resources available (CPU/memory under node's own thresholds)
+  - Node has no capacity info (backwards compatibility)
+
+  Returns false if:
+  - Node is at global capacity
+  - Node is at module-specific capacity
+  - Node's CPU is at/above its max_cpu threshold
+  - Node's memory is at/above its max_memory threshold
+  - Node's disk is at/above its max_disk threshold (unless bypassed for sticky placement)
+
+  ## Options
+
+    * `:matching_level` - sticky placement matching level for this node. When `0`,
+      the disk check is bypassed because the child's data is on this node's disk.
+  """
+  def can_node_accept_module?(node_health, module, opts \\ []) do
+    opts = Keyword.validate!(opts, [:matching_level])
+    matching_level = Keyword.get(opts, :matching_level)
+    bypass_disk_check = matching_level == 0
+
+    case node_health do
+      {:healthy, %{capacity: nil, resources: nil}} ->
+        # no capacity info (old heartbeat or no limits configured)
+        not node_draining?(node_health)
+
+      {:healthy, info} ->
+        if node_draining?(node_health) do
+          false
+        else
+          capacity_ok = check_capacity_ok(info[:capacity], module)
+
+          resources_ok =
+            check_resources_ok(info[:resources], bypass_disk_check: bypass_disk_check)
+
+          capacity_ok and resources_ok
+        end
+
+      _ ->
+        # :stale, :unknown, or malformed
+        false
+    end
+  end
+
+  defp check_capacity_ok(nil, _module), do: true
+
+  defp check_capacity_ok(capacity, module) when is_map(capacity) do
+    # check total limit
+    total_ok =
+      case capacity[:total] do
+        %{current: current, limit: limit} -> current < limit
+        nil -> true
+      end
+
+    # check module-specific limit
+    module_ok =
+      case capacity[module] do
+        %{current: current, limit: limit} -> current < limit
+        nil -> true
+      end
+
+    total_ok and module_ok
+  end
+
+  defp check_resources_ok(nil, _opts), do: true
+
+  defp check_resources_ok(resources, opts) when is_map(resources) do
+    bypass_disk_check = Keyword.get(opts, :bypass_disk_check, false)
+
+    # use the target node's own thresholds (they may differ from node-local ones)
+    cpu_ok =
+      case {resources[:cpu], resources[:max_cpu]} do
+        {cpu, max_cpu} when is_number(cpu) and is_number(max_cpu) ->
+          cpu < max_cpu
+
+        {nil, _} ->
+          true
+
+        {_, nil} ->
+          true
+      end
+
+    memory_ok =
+      case {resources[:memory], resources[:max_memory]} do
+        {memory, max_memory} when is_number(memory) and is_number(max_memory) ->
+          memory < max_memory
+
+        {nil, _} ->
+          true
+
+        {_, nil} ->
+          true
+      end
+
+    disk_ok =
+      if bypass_disk_check do
+        true
+      else
+        case {resources[:disk], resources[:max_disk]} do
+          {disk, max_disk} when is_number(disk) and is_number(max_disk) ->
+            disk < max_disk
+
+          {nil, _} ->
+            true
+
+          {_, nil} ->
+            true
+        end
+      end
+
+    cpu_ok and memory_ok and disk_ok
+  end
+
+  defp node_draining?({:healthy, %{heartbeat_meta: heartbeat_meta}})
+       when is_map(heartbeat_meta) do
+    Map.get(heartbeat_meta, "draining") == true
+  end
+
+  defp node_draining?(_), do: false
+
+  defp capacity_rejection_reason({:healthy, info}, module) do
+    if node_draining?({:healthy, info}) do
+      "node draining for shutdown"
+    else
+      issues = []
+
+      # Check total capacity
+      issues =
+        case info[:capacity][:total] do
+          %{current: current, limit: limit} when current >= limit ->
+            ["total: #{current}/#{limit}" | issues]
+
+          _ ->
+            issues
+        end
+
+      # Check module capacity
+      issues =
+        case info[:capacity][module] do
+          %{current: current, limit: limit} when current >= limit ->
+            ["#{inspect(module)}: #{current}/#{limit}" | issues]
+
+          _ ->
+            issues
+        end
+
+      # Check CPU
+      issues =
+        case info[:resources] do
+          %{cpu: cpu, max_cpu: max_cpu} when cpu >= max_cpu ->
+            ["CPU: #{cpu}% >= #{max_cpu}%" | issues]
+
+          _ ->
+            issues
+        end
+
+      # Check memory
+      issues =
+        case info[:resources] do
+          %{memory: memory, max_memory: max_memory} when memory >= max_memory ->
+            ["memory: #{memory}% >= #{max_memory}%" | issues]
+
+          _ ->
+            issues
+        end
+
+      case issues do
+        [] -> "node at capacity (unknown reason)"
+        _ -> "node at capacity: " <> Enum.join(issues, ", ")
+      end
+    end
+  end
+
+  defp capacity_rejection_reason(:stale, _), do: "node heartbeat stale"
+  defp capacity_rejection_reason(:unknown, _), do: "node heartbeat unknown"
+end
