@@ -1,6 +1,6 @@
 # BEAM Continuum
 
-![BEAM Continuum fleet demo dashboard](demo.png)
+![BEAM Continuum fleet demo dashboard](demo.png?v=2)
 
 A live warehouse simulation that demonstrates durable processes in Elixir,
 Erlang, and OTP. Each robot is a [DurableServer](https://github.com/phoenixframework/durable_server)
